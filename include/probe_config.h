@@ -4,8 +4,8 @@
 #include "esp_adc/adc_oneshot.h"
 
 /* ESP32-WROOM board with external ST7789 1.9" 170x320 SPI TFT. */
-#define PROBE_ADC_CHANNEL       ADC_CHANNEL_7 /* GPIO35 */
-#define PROBE_ADC_GPIO          GPIO_NUM_35
+#define PROBE_ADC_CHANNEL       ADC_CHANNEL_0 /* GPIO36 / SENSOR_VP */
+#define PROBE_ADC_GPIO          GPIO_NUM_36
 #define PROBE_COMPARATOR_GPIO   GPIO_NUM_22
 #define PROBE_BIAS_GPIO         GPIO_NUM_27
 #define PROBE_TEST_SIGNAL_GPIO  GPIO_NUM_26
@@ -13,33 +13,44 @@
 /* The old probe functions are disabled while the power-channel hardware is
  * being debugged.
  */
-#define ANALOG_PROBE_ENABLED    0
+#define ANALOG_PROBE_ENABLED    1
 #define TIMING_INPUT_ENABLED    0
-#define UART_PROBE_ENABLED      0
+#define UART_PROBE_ENABLED      1
 #define IO26_DIAG_ENABLED       0
 
 /* Panel controls. Internal pull-ups are enabled in encoder_input.c/control.c. */
 #define ENCODER_A_GPIO          GPIO_NUM_13
 #define ENCODER_B_GPIO          GPIO_NUM_27
 #define ENCODER_BUTTON_GPIO     GPIO_NUM_14
-#define UI_BUTTON_GPIO          GPIO_NUM_18
+#define UI_BUTTON_GPIO          GPIO_NUM_NC
 #define MODE_BUTTON_GPIO        GPIO_NUM_32
 #define GENERATOR_OUTPUT_GPIO   GPIO_NUM_23
 
-/* UART experiment, currently disabled by UART_PROBE_ENABLED=0.
- * IO26 is now used as I2C SCL, so UART B must stay disabled on this board.
- */
-#define UART_A_RX_GPIO          GPIO_NUM_22
-#define UART_B_TX_GPIO          GPIO_NUM_26
+/* UART experiment. */
+#define UART_A_RX_GPIO          GPIO_NUM_19
+#define UART_A_TX_GPIO          GPIO_NUM_18
 #define UART_TEST_BAUD          115200
-#define UART_DISPLAY_CHARS      15
+#define UART_PREVIEW_CHARS      15
+#define UART_DISPLAY_CHARS      (UART_PREVIEW_CHARS + 3U)
+
+/* Passive I2C sniffer. External jumpers:
+ *   IO26/SCL -> IO21
+ *   IO25/SDA -> IO22
+ */
+#define I2C_SNIFFER_ENABLED     1
+#define I2C_SNIFFER_SCL_GPIO    GPIO_NUM_21
+#define I2C_SNIFFER_SDA_GPIO    GPIO_NUM_22
+/* I2S1 drives BCK on IO19; I2S0 samples that same pad as its external clock. */
+#define I2C_SNIFFER_I2S_CLOCK_OUT_GPIO GPIO_NUM_19
+#define I2C_SNIFFER_I2S_CLOCK_IN_GPIO  GPIO_NUM_19
+#define I2C_SNIFFER_OWNS_UART_PINS     1
 
 /* External I2C board. */
 #define INA238_I2C_ENABLED      1
 #define INA238_I2C_PORT         I2C_NUM_0
 #define INA238_I2C_SDA_GPIO     GPIO_NUM_25
 #define INA238_I2C_SCL_GPIO     GPIO_NUM_26
-#define INA238_I2C_HZ           40000U
+#define INA238_I2C_HZ           100000U
 #define INA238_1_ADDRESS        0x41U
 #define INA238_2_ADDRESS        0x44U
 #define INA238_1_SHUNT_UOHM     100000U
@@ -82,6 +93,20 @@
 #define CHANNEL_A_LDO_R_BOTTOM_OHM      2000U
 #define CHANNEL_A_LDO_R_DAC_OHM         3600U
 
+/* Hidden output-voltage correction.
+ *
+ * The UI setpoint stays unchanged. The power-channel drivers add a small
+ * internal correction to remove static setpoint error and load-dependent
+ * output drop. Integral trim is frozen while the channel is in CC mode.
+ */
+#define OUTPUT_VOLTAGE_TRIM_ENABLED     1
+#define OUTPUT_VOLTAGE_TRIM_MAX_MV      300
+#define OUTPUT_VOLTAGE_TRIM_DEADBAND_MV 15
+#define OUTPUT_VOLTAGE_TRIM_STEP_MV     2
+#define OUTPUT_VOLTAGE_TRIM_GAIN_DIV    16
+#define CHANNEL_A_LOAD_COMP_MOHM        30
+#define CHANNEL_B_LOAD_COMP_MOHM        30
+
 /* LM51772 channel B buck-boost output.
  *
  * ADDR/SLOPE tied to GND selects I2C address 0x6A.
@@ -117,22 +142,14 @@
 #define TFT_Y_OFFSET            35
 
 /*
- * Temporary analog front end for software debugging, without an op-amp:
+ * Input-voltage monitor on GPIO36:
  *
- *   +3.3 V -- 68k -- probe node -- 68k -- GND
- *                         |
- *                         +-- 200k -- GPIO35/ADC -- 68k -- GND
- *                         |
- * GPIO27 test -- 300k ----+
+ *   VIN -- 102k -- GPIO36/ADC -- 12k -- GND
  *
- * ADC_INPUT_SCALE converts calibrated GPIO35 millivolts back to the probe
- * node voltage. With a low-impedance source connected to the probe tip, GPIO27
- * held LOW through 300 kOhm only adds a weak load; the ADC divider remains:
- *
- *   Vprobe = Vadc * (200k + 68k) / 68k = Vadc * 3.941176
+ * Vin = Vadc * (102k + 12k) / 12k = Vadc * 9.5.
  */
-#define ADC_INPUT_SCALE         3.941176f
-#define PROBE_ADC_ATTEN         ADC_ATTEN_DB_0
+#define ADC_INPUT_SCALE         9.5f
+#define PROBE_ADC_ATTEN         ADC_ATTEN_DB_12
 #define LOGIC_LOW_MAX_MV        800U
 #define LOGIC_HIGH_MIN_MV       2600U
 #define TIP_OVERVOLTAGE_MV      15000U
@@ -171,6 +188,6 @@
  * EVENT UP/DN messages for every bit edge.
  */
 #define EVENT_SINGLE_EDGE_MAX_HZ 1.0f
-#define UI_PERIOD_MS            150U
+#define UI_PERIOD_MS            50U
 #define TELEMETRY_PERIOD_MS     250U
 #define BLUETOOTH_DEVICE_NAME   "ESP32-Logic-Probe"

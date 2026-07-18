@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "esp_check.h"
+#include "esp_log.h"
 #include "i2c_bus.h"
 #include "probe_config.h"
 #include "driver/i2c_master.h"
@@ -54,6 +55,7 @@ static ina238_device_t s_devices[2] = {
     {.address = INA238_1_ADDRESS, .shunt_uohm = INA238_1_SHUNT_UOHM, .wide_range = true},
     {.address = INA238_2_ADDRESS, .shunt_uohm = INA238_2_SHUNT_UOHM, .wide_range = true},
 };
+static const char *TAG = "ina238";
 
 /* write_register
  * Inputs: dev is one INA238 device; reg/value select the register write.
@@ -62,11 +64,17 @@ static ina238_device_t s_devices[2] = {
  */
 static esp_err_t write_register(ina238_device_t *dev, uint8_t reg, uint16_t value)
 {
+    static uint32_t debug_log_count;
     uint8_t bytes[3] = {
         reg,
         (uint8_t)(value >> 8),
         (uint8_t)value,
     };
+    if (false && debug_log_count < 200U) {
+        ++debug_log_count;
+        ESP_LOGI(TAG, "I2C_TX INA W %02X %02X %02X %02X",
+                 dev->address, reg, bytes[1], bytes[2]);
+    }
     return i2c_master_transmit(dev->dev, bytes, sizeof(bytes), 100);
 }
 
@@ -78,7 +86,12 @@ static esp_err_t write_register(ina238_device_t *dev, uint8_t reg, uint16_t valu
  */
 static esp_err_t read_register(ina238_device_t *dev, uint8_t reg, uint16_t *value)
 {
+    static uint32_t debug_log_count;
     uint8_t data[2] = {0};
+    if (false && debug_log_count < 200U) {
+        ++debug_log_count;
+        ESP_LOGI(TAG, "I2C_TX INA R %02X %02X", dev->address, reg);
+    }
     esp_err_t err = i2c_master_transmit_receive(dev->dev, &reg, 1, data, sizeof(data), 100);
     if (err != ESP_OK) return err;
     *value = ((uint16_t)data[0] << 8) | data[1];

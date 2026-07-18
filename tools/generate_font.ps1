@@ -24,7 +24,7 @@ function Convert-Font([string]$prefix, [single]$pointSize) {
     $bitmapBytes = New-Object 'System.Collections.Generic.List[byte]'
     $glyphLines = New-Object 'System.Collections.Generic.List[string]'
 
-    for ($code = 32; $code -le 90; $code++) {
+    for ($code = 32; $code -le 126; $code++) {
         $char = [char]$code
         $bmp = New-Object System.Drawing.Bitmap(64, 64, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
         $graphics = [System.Drawing.Graphics]::FromImage($bmp)
@@ -110,7 +110,7 @@ $($small.Data -join "`n")
 static const smooth_glyph_t roboto_18_glyphs[] = {
 $($small.Glyphs -join ",`n")
 };
-const smooth_font_t roboto_18 = {roboto_18_bitmap, roboto_18_glyphs, 32, 90, $($small.Height)};
+const smooth_font_t roboto_18 = {roboto_18_bitmap, roboto_18_glyphs, 32, 126, $($small.Height)};
 
 static const uint8_t roboto_30_bitmap[] = {
 $($large.Data -join "`n")
@@ -118,10 +118,9 @@ $($large.Data -join "`n")
 static const smooth_glyph_t roboto_30_glyphs[] = {
 $($large.Glyphs -join ",`n")
 };
-const smooth_font_t roboto_30 = {roboto_30_bitmap, roboto_30_glyphs, 32, 90, $($large.Height)};
+const smooth_font_t roboto_30 = {roboto_30_bitmap, roboto_30_glyphs, 32, 126, $($large.Height)};
 "@
 
 [IO.File]::WriteAllText((Join-Path $ProjectRoot 'include\smooth_font.h'), $header, [Text.UTF8Encoding]::new($false))
 [IO.File]::WriteAllText((Join-Path $ProjectRoot 'src\smooth_font.c'), $source, [Text.UTF8Encoding]::new($false))
 Write-Host "Generated Roboto fonts: $($small.Data.Count + $large.Data.Count) data rows"
-

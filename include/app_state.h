@@ -14,6 +14,7 @@ typedef enum {
     APP_MODE_RS485,
     APP_MODE_CAN,
     APP_MODE_I2C,
+    APP_MODE_SETTING,
     APP_MODE_COUNT
 } app_mode_t;
 
@@ -29,6 +30,10 @@ typedef enum {
     CONTROL_SELECT_UART_BAUD = 8,
     CONTROL_SELECT_RS485_BAUD = 9,
     CONTROL_SELECT_CAN_BITRATE = 10,
+    CONTROL_SELECT_OVERCURRENT = 11,
+    CONTROL_SELECT_OVERHEAT = 12,
+    CONTROL_SELECT_OVERPOWER = 13,
+    CONTROL_SELECT_VOLUME = 14,
 } control_select_t;
 
 typedef enum {
@@ -82,8 +87,16 @@ typedef struct {
 
 typedef struct {
     char text[UART_DISPLAY_CHARS + 1U];
+    char lines[3][UART_DISPLAY_CHARS + 1U];
     uint32_t errors;
 } app_uart_state_t;
+
+typedef struct {
+    char text[UART_DISPLAY_CHARS + 1U];
+    char lines[3][UART_DISPLAY_CHARS + 1U];
+    uint32_t packets;
+    uint32_t errors;
+} app_i2c_sniffer_state_t;
 
 typedef struct {
     bool valid;
@@ -105,6 +118,7 @@ typedef struct {
     bool valid;
     bool output_enabled;
     bool ldo_dac_saturated;
+    bool current_limit_active;
     bool status_valid;
     bool limit_valid;
     uint8_t address;
@@ -124,6 +138,7 @@ typedef struct {
 typedef struct {
     bool valid;
     bool output_enabled;
+    bool current_limit_active;
     bool status_valid;
     bool limit_valid;
     uint8_t address;
@@ -143,6 +158,8 @@ typedef struct {
     bool s_button;
     bool mode_button;
     app_mode_t mode;
+    bool menu_open;
+    uint8_t menu_index;
     uint16_t u1_mv;
     uint16_t i1_ma;
     uint16_t u2_mv;
@@ -153,6 +170,10 @@ typedef struct {
     uint32_t uart_baud;
     uint32_t rs485_baud;
     uint32_t can_bitrate;
+    bool overcurrent_cc;
+    uint8_t overheat_c;
+    uint16_t overpower_w;
+    uint8_t volume_percent;
     uint8_t selected_value;
     uint8_t selected_digit;
     int32_t last_encoder_steps;
@@ -167,6 +188,7 @@ typedef struct {
     app_analog_state_t analog;
     app_timing_state_t timing;
     app_uart_state_t uart;
+    app_i2c_sniffer_state_t i2c_sniffer;
     app_ina238_state_t ina238;
     app_tps55289_state_t tps55289;
     app_lm51772_state_t lm51772;

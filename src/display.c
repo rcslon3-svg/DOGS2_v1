@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -11,6 +12,7 @@
 #include "freertos/task.h"
 #include "probe_config.h"
 #include "smooth_font.h"
+#include "splash_bitmap.h"
 
 #define RGB565(r, g, b) (uint16_t)((((r) & 0xF8U) << 8) | (((g) & 0xFCU) << 3) | ((b) >> 3))
 #define COLOR_BLACK RGB565(0, 0, 0)
@@ -22,6 +24,21 @@
 #define COLOR_CYAN RGB565(0, 210, 255)
 #define COLOR_ORANGE RGB565(255, 120, 0)
 #define COLOR_GRAY RGB565(70, 75, 85)
+#define COLOR_BADGE_CV_FG COLOR_WHITE
+#define COLOR_BADGE_CV_BG RGB565(18, 18, 18)
+#define COLOR_BADGE_CC_FG COLOR_BLACK
+#define COLOR_BADGE_CC_BG RGB565(0, 210, 220)
+#define COLOR_ALERT_RED_FG COLOR_BLACK
+#define COLOR_ALERT_RED_BG RGB565(0, 210, 220)
+#define TFT_BACKLIGHT_LEDC_MODE LEDC_HIGH_SPEED_MODE
+#define TFT_BACKLIGHT_LEDC_TIMER LEDC_TIMER_3
+#define TFT_BACKLIGHT_LEDC_CHANNEL LEDC_CHANNEL_7
+#define TFT_BACKLIGHT_LEDC_RESOLUTION LEDC_TIMER_10_BIT
+#define TFT_BACKLIGHT_LEDC_HZ 20000U
+#define TFT_BACKLIGHT_DUTY_MAX ((1U << 10U) - 1U)
+#define TFT_BACKLIGHT_FADE_MS 800U
+#define TFT_BACKLIGHT_FADE_STEPS 32U
+#define TFT_SPLASH_VISIBLE_MS 2000U
 
 static spi_device_handle_t s_tft;
 static const char *TAG = "display";
@@ -34,11 +51,61 @@ static const char *TAG = "display";
  * line now reaches the display as one continuous image.
  */
 static uint16_t s_text_buffer[TFT_WIDTH * 40];
+static uint8_t s_fill_block[4096];
 
-static void backlight_set(bool on)
+static uint32_t backlight_physical_duty(uint32_t logical_duty)
 {
-    gpio_set_level(TFT_BACKLIGHT_GPIO,
-                   on ? TFT_BACKLIGHT_ACTIVE_LEVEL : !TFT_BACKLIGHT_ACTIVE_LEVEL);
+    if (logical_duty > TFT_BACKLIGHT_DUTY_MAX) logical_duty = TFT_BACKLIGHT_DUTY_MAX;
+    return TFT_BACKLIGHT_ACTIVE_LEVEL ? logical_duty : (TFT_BACKLIGHT_DUTY_MAX - logical_duty);
+}
+
+static esp_err_t backlight_pwm_set(uint32_t logical_duty)
+{
+    esp_err_t err = ledc_set_duty(TFT_BACKLIGHT_LEDC_MODE,
+                                  TFT_BACKLIGHT_LEDC_CHANNEL,
+                                  backlight_physical_duty(logical_duty));
+    if (err != ESP_OK) return err;
+    return ledc_update_duty(TFT_BACKLIGHT_LEDC_MODE, TFT_BACKLIGHT_LEDC_CHANNEL);
+}
+
+static esp_err_t backlight_pwm_init(void)
+{
+    ledc_timer_config_t timer = {
+        .speed_mode = TFT_BACKLIGHT_LEDC_MODE,
+        .timer_num = TFT_BACKLIGHT_LEDC_TIMER,
+        .duty_resolution = TFT_BACKLIGHT_LEDC_RESOLUTION,
+        .freq_hz = TFT_BACKLIGHT_LEDC_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "backlight timer");
+
+    ledc_channel_config_t channel = {
+        .gpio_num = TFT_BACKLIGHT_GPIO,
+        .speed_mode = TFT_BACKLIGHT_LEDC_MODE,
+        .channel = TFT_BACKLIGHT_LEDC_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = TFT_BACKLIGHT_LEDC_TIMER,
+        .duty = backlight_physical_duty(0U),
+        .hpoint = 0,
+        .flags = {
+            .output_invert = 0,
+        },
+    };
+    return ledc_channel_config(&channel);
+}
+
+static void backlight_fade_in(void)
+{
+    const TickType_t step_delay = pdMS_TO_TICKS(TFT_BACKLIGHT_FADE_MS / TFT_BACKLIGHT_FADE_STEPS);
+    for (uint32_t step = 0U; step <= TFT_BACKLIGHT_FADE_STEPS; ++step) {
+        uint32_t duty = (TFT_BACKLIGHT_DUTY_MAX * step) / TFT_BACKLIGHT_FADE_STEPS;
+        esp_err_t err = backlight_pwm_set(duty);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "backlight duty: %s", esp_err_to_name(err));
+            return;
+        }
+        if (step < TFT_BACKLIGHT_FADE_STEPS) vTaskDelay(step_delay);
+    }
 }
 
 static void log_pin_levels(const char *stage)
@@ -117,22 +184,61 @@ static void set_window(int x, int y, int width, int height)
 static void fill_rect(int x, int y, int width, int height, uint16_t color)
 {
     if (s_tft == NULL || width <= 0 || height <= 0) return;
-    uint8_t block[512];
-    for (size_t i = 0; i < sizeof(block); i += 2U) {
-        block[i] = (uint8_t)(color >> 8);
-        block[i + 1U] = (uint8_t)color;
+    for (size_t i = 0; i < sizeof(s_fill_block); i += 2U) {
+        s_fill_block[i] = (uint8_t)(color >> 8);
+        s_fill_block[i + 1U] = (uint8_t)color;
     }
     set_window(x, y, width, height);
     size_t remaining = (size_t)width * (size_t)height * 2U;
     gpio_set_level(TFT_DC_GPIO, 1);
     while (remaining != 0U) {
-        size_t amount = remaining > sizeof(block) ? sizeof(block) : remaining;
-        spi_transaction_t transaction = {.length = amount * 8U, .tx_buffer = block};
+        size_t amount = remaining > sizeof(s_fill_block) ? sizeof(s_fill_block) : remaining;
+        spi_transaction_t transaction = {.length = amount * 8U, .tx_buffer = s_fill_block};
         esp_err_t err = spi_device_polling_transmit(s_tft, &transaction);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "fill tx: %s", esp_err_to_name(err));
             return;
         }
+        remaining -= amount;
+    }
+}
+
+/* draw_splash_bitmap
+ * Inputs: none.
+ * Returns: none.
+ * Does: sends the pre-rendered 320x170 RGB565 startup splash to the TFT.
+ */
+static void draw_splash_bitmap(void)
+{
+    if (s_tft == NULL) return;
+    if (SPLASH_BITMAP_WIDTH != TFT_WIDTH || SPLASH_BITMAP_HEIGHT != TFT_HEIGHT) {
+        ESP_LOGE(TAG, "splash size mismatch: %ux%u for TFT %dx%d",
+                 (unsigned)SPLASH_BITMAP_WIDTH,
+                 (unsigned)SPLASH_BITMAP_HEIGHT,
+                 TFT_WIDTH,
+                 TFT_HEIGHT);
+        return;
+    }
+
+    set_window(0, 0, TFT_WIDTH, TFT_HEIGHT);
+    gpio_set_level(TFT_DC_GPIO, 1);
+    const uint8_t *bytes = splash_bitmap_rgb565;
+    size_t remaining = splash_bitmap_rgb565_size;
+    while (remaining != 0U) {
+        size_t amount = remaining > sizeof(s_fill_block) ? sizeof(s_fill_block) : remaining;
+        for (size_t i = 0U; i < amount; i += 2U) {
+            uint16_t pixel = (uint16_t)((uint16_t)bytes[i] << 8) | bytes[i + 1U];
+            pixel ^= 0xFFFFU;
+            s_fill_block[i] = (uint8_t)(pixel >> 8);
+            s_fill_block[i + 1U] = (uint8_t)pixel;
+        }
+        spi_transaction_t transaction = {.length = amount * 8U, .tx_buffer = s_fill_block};
+        esp_err_t err = spi_device_polling_transmit(s_tft, &transaction);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "splash tx: %s", esp_err_to_name(err));
+            return;
+        }
+        bytes += amount;
         remaining -= amount;
     }
 }
@@ -382,16 +488,23 @@ static uint8_t measured_current_decimals(char channel)
     return channel == 'A' ? 5U : 4U;
 }
 
-static void format_measured_current(char *out,
-                                    size_t size,
-                                    char channel,
-                                    const app_ina238_channel_t *measurement)
+static int64_t measured_current_ua(char channel, const app_ina238_channel_t *measurement)
 {
+    if (!measurement->valid || measurement->shunt_uohm == 0U) return 0;
     int64_t current_ua = ((int64_t)measurement->shunt_uv * 1000000LL) /
                          (int64_t)measurement->shunt_uohm;
     if (channel == 'A') {
         current_ua -= ((int64_t)measurement->bus_mv * 420LL + 5000LL) / 10000LL;
     }
+    return current_ua;
+}
+
+static void format_measured_current(char *out,
+                                    size_t size,
+                                    char channel,
+                                    const app_ina238_channel_t *measurement)
+{
+    int64_t current_ua = measured_current_ua(channel, measurement);
     uint8_t decimals = measured_current_decimals(channel);
     int64_t scale = 1;
     for (uint8_t i = 0; i < decimals; ++i) scale *= 10LL;
@@ -414,7 +527,36 @@ static void format_measured_current(char *out,
     }
 }
 
-static void draw_channel_actual_line(int y, char channel, const app_ina238_channel_t *measurement)
+static int64_t channel_power_mw(char channel, const app_ina238_channel_t *measurement)
+{
+    if (!measurement->valid) return 0;
+    int64_t current_ua = measured_current_ua(channel, measurement);
+    int64_t power_nw = (int64_t)measurement->bus_mv * current_ua;
+    if (power_nw < 0) return -((-power_nw + 500000LL) / 1000000LL);
+    return (power_nw + 500000LL) / 1000000LL;
+}
+
+static void append_cv_cc_badge(char *line, uint16_t *fg, uint16_t *bg, size_t *pos, bool cc_active)
+{
+    size_t badge_start;
+    uint16_t badge_fg = cc_active ? COLOR_BADGE_CC_FG : COLOR_BADGE_CV_FG;
+    uint16_t badge_bg = cc_active ? COLOR_BADGE_CC_BG : COLOR_BADGE_CV_BG;
+
+    append_colored(line, fg, bg, pos, " ", COLOR_GRAY);
+    badge_start = *pos;
+    append_colored(line, fg, bg, pos, cc_active ? "CC" : "CV", badge_fg);
+    mark_range(fg,
+               bg,
+               badge_start,
+               2U,
+               badge_fg,
+               badge_bg);
+}
+
+static void draw_channel_actual_line(int y,
+                                     char channel,
+                                     const app_ina238_channel_t *measurement,
+                                     bool cc_active)
 {
     char line[64] = "";
     uint16_t fg[64];
@@ -440,6 +582,7 @@ static void draw_channel_actual_line(int y, char channel, const app_ina238_chann
         append_colored(line, fg, bg, &pos, "--.--", COLOR_GRAY);
     }
     append_colored(line, fg, bg, &pos, "A", COLOR_CYAN);
+    append_cv_cc_badge(line, fg, bg, &pos, cc_active);
 
     draw_rich_text(2, y, line, &roboto_30, fg, bg);
 }
@@ -475,6 +618,7 @@ static void draw_channel_set_line(int y,
     size_t pos = 0U;
     char voltage[8];
     char current[8];
+    char temperature[8];
     size_t voltage_start;
     size_t current_start;
 
@@ -492,8 +636,22 @@ static void draw_channel_set_line(int y,
     append_colored(line, fg, bg, &pos, "A  ", COLOR_CYAN);
 
     if (measurement->valid) {
-        append_format_colored(line, fg, bg, &pos, COLOR_GRAY,
-                              "%.0fC", (double)measurement->temperature_mc / 1000.0);
+        size_t temperature_start = pos;
+        snprintf(temperature,
+                 sizeof(temperature),
+                 "%.0fC",
+                 (double)measurement->temperature_mc / 1000.0);
+        append_colored(line, fg, bg, &pos, temperature, COLOR_GRAY);
+        if (measurement->temperature_mc > 45000) {
+            size_t digit_count = strlen(temperature);
+            if (digit_count != 0U && temperature[digit_count - 1U] == 'C') --digit_count;
+            mark_range(fg,
+                       bg,
+                       temperature_start,
+                       digit_count,
+                       COLOR_ALERT_RED_FG,
+                       COLOR_ALERT_RED_BG);
+        }
     } else {
         append_colored(line, fg, bg, &pos, "--C", COLOR_GRAY);
     }
@@ -644,24 +802,50 @@ static void draw_generator_screen(const app_state_t *s)
     draw_bottom_actuals(s);
 }
 
-static void draw_protocol_screen(const app_state_t *s,
-                                 const char *title,
-                                 uint32_t rate,
-                                 const char *rate_suffix,
-                                 uint8_t select)
+static void draw_serial_header(const app_state_t *s, const char *title, uint32_t rate, uint8_t select)
 {
+    char line[64] = "";
     char value[16];
     uint16_t fg[64];
     uint16_t bg[64];
-
-    draw_text(8, 4, title, &roboto_18, COLOR_CYAN);
-    snprintf(value, sizeof(value), "%lu", (unsigned long)rate);
-    draw_highlighted_value_line(30, "BAUD", value, rate_suffix, select, s);
+    size_t pos = 0U;
+    size_t baud_start;
 
     fill_text_colors(fg, bg, 64U);
-    draw_rich_text(8, 74, "RX:", &roboto_18, fg, bg);
-    draw_rich_text(8, 98, "<NO DATA>", &roboto_18, fg, bg);
+    append_colored(line, fg, bg, &pos, title, COLOR_CYAN);
+    append_colored(line, fg, bg, &pos, "  BAUD ", COLOR_CYAN);
+    baud_start = pos;
+    snprintf(value, sizeof(value), "%lu", (unsigned long)rate);
+    append_colored(line, fg, bg, &pos, value, COLOR_YELLOW);
 
+    if (s->control.selected_value == select) {
+        mark_range(fg, bg, baud_start, strlen(value), COLOR_BLACK, COLOR_YELLOW);
+    }
+
+    draw_rich_text(8, 4, line, &roboto_18, fg, bg);
+}
+
+static void draw_uart_rx_line(int y, const char *text)
+{
+    draw_text(8, y, text[0] != '\0' ? text : "-", &roboto_30,
+              text[0] != '\0' ? COLOR_WHITE : COLOR_GRAY);
+}
+
+static void draw_serial_screen(const app_state_t *s, const char *title, uint32_t rate, uint8_t select)
+{
+    draw_serial_header(s, title, rate, select);
+    draw_uart_rx_line(28, s->uart.lines[0]);
+    draw_uart_rx_line(60, s->uart.lines[1]);
+    draw_uart_rx_line(88, s->uart.lines[2]);
+    draw_bottom_actuals(s);
+}
+
+static void draw_i2c_sniffer_screen(const app_state_t *s)
+{
+    draw_text(8, 4, "I2C SNIFF", &roboto_18, COLOR_CYAN);
+    draw_uart_rx_line(28, s->i2c_sniffer.lines[0]);
+    draw_uart_rx_line(60, s->i2c_sniffer.lines[1]);
+    draw_uart_rx_line(88, s->i2c_sniffer.lines[2]);
     draw_bottom_actuals(s);
 }
 
@@ -682,6 +866,60 @@ static void draw_can_screen(const app_state_t *s)
     draw_bottom_actuals(s);
 }
 
+static void draw_setting_line(int y,
+                              const char *label,
+                              const char *value,
+                              uint8_t select,
+                              const app_state_t *s)
+{
+    char line[64] = "";
+    uint16_t fg[64];
+    uint16_t bg[64];
+    size_t pos = 0U;
+    size_t value_start;
+
+    fill_text_colors(fg, bg, 64U);
+    append_colored(line, fg, bg, &pos, label, COLOR_GRAY);
+    append_colored(line, fg, bg, &pos, " ", COLOR_GRAY);
+    value_start = pos;
+    append_colored(line, fg, bg, &pos, value, COLOR_YELLOW);
+
+    if (s->control.selected_value == select) {
+        if (s->control.selected_digit == CONTROL_DIGIT_WHOLE ||
+            select == CONTROL_SELECT_OVERCURRENT) {
+            mark_range(fg, bg, value_start, strlen(value), COLOR_BLACK, COLOR_YELLOW);
+        } else {
+            mark_range(fg,
+                       bg,
+                       value_start + editable_digit_offset(value, s->control.selected_digit),
+                       1U,
+                       COLOR_BLACK,
+                       COLOR_YELLOW);
+        }
+    }
+
+    draw_rich_text(8, y, line, &roboto_18, fg, bg);
+}
+
+static void draw_setting_screen(const app_state_t *s)
+{
+    char value[8];
+
+    draw_text(8, 4, "SETTING", &roboto_18, COLOR_CYAN);
+
+    draw_setting_line(30,
+                      "Overcurrent",
+                      s->control.overcurrent_cc ? "CC" : "OFF",
+                      CONTROL_SELECT_OVERCURRENT,
+                      s);
+    snprintf(value, sizeof(value), "%02u", (unsigned)s->control.overheat_c);
+    draw_setting_line(58, "Overheat", value, CONTROL_SELECT_OVERHEAT, s);
+    snprintf(value, sizeof(value), "%03u", (unsigned)s->control.overpower_w);
+    draw_setting_line(86, "Overpower", value, CONTROL_SELECT_OVERPOWER, s);
+    snprintf(value, sizeof(value), "%03u", (unsigned)s->control.volume_percent);
+    draw_setting_line(114, "Volume", value, CONTROL_SELECT_VOLUME, s);
+}
+
 static void draw_reserved_screen(const app_state_t *s, const char *title)
 {
     draw_text(8, 4, title, &roboto_18, COLOR_CYAN);
@@ -689,11 +927,117 @@ static void draw_reserved_screen(const app_state_t *s, const char *title)
     draw_bottom_actuals(s);
 }
 
+static const char *mode_menu_name(app_mode_t mode)
+{
+    switch (mode) {
+        case APP_MODE_POWER_SUPPLY: return "POWER SOURCE";
+        case APP_MODE_GENERATOR:    return "GENERATOR";
+        case APP_MODE_UART:         return "UART";
+        case APP_MODE_1WIRE:        return "1WIRE";
+        case APP_MODE_RS485:        return "RS485";
+        case APP_MODE_CAN:          return "CAN";
+        case APP_MODE_I2C:          return "I2C";
+        case APP_MODE_SETTING:      return "SETTING";
+        default:                    return "?";
+    }
+}
+
+static void draw_mode_menu_scroll_indicator(uint8_t selected, uint8_t visible_rows)
+{
+    const uint8_t total_rows = (uint8_t)APP_MODE_COUNT;
+    const int track_x = 5;
+    const int track_y = 7;
+    const int track_width = 3;
+    const int track_height = 156;
+    const int thumb_height = 24;
+
+    fill_rect(0, 0, 15, TFT_HEIGHT, COLOR_BLACK);
+    if (total_rows <= visible_rows) return;
+
+    uint8_t max_selected = (uint8_t)(total_rows - 1U);
+    int travel = track_height - thumb_height;
+    int thumb_y = track_y;
+    if (max_selected != 0U) {
+        thumb_y += (travel * (int)selected + (int)max_selected / 2) / (int)max_selected;
+    }
+
+    fill_rect(track_x, track_y, track_width, track_height, COLOR_GRAY);
+    fill_rect(track_x - 1, thumb_y, track_width + 2, thumb_height, COLOR_CYAN);
+}
+
+static void draw_mode_menu(const app_state_t *s, bool force)
+{
+    const uint8_t visible_rows = 7U;
+    const int row_height = 23;
+    static char previous_lines[7][64];
+    static uint8_t previous_top = 0xFFU;
+    static uint8_t previous_selected = 0xFFU;
+    static app_mode_t previous_active = APP_MODE_COUNT;
+    uint8_t top = 0U;
+
+    if ((uint8_t)APP_MODE_COUNT > visible_rows) {
+        if (s->control.menu_index >= visible_rows) {
+            top = (uint8_t)(s->control.menu_index - visible_rows + 1U);
+        }
+    }
+
+    if (force) {
+        fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
+        for (uint8_t i = 0U; i < visible_rows; ++i) previous_lines[i][0] = '\0';
+        previous_top = 0xFFU;
+        previous_selected = 0xFFU;
+        previous_active = APP_MODE_COUNT;
+    }
+
+    for (uint8_t row = 0U; row < visible_rows; ++row) {
+        uint8_t mode_index = (uint8_t)(top + row);
+        if (mode_index >= (uint8_t)APP_MODE_COUNT) break;
+
+        char line[64];
+        uint16_t fg[64];
+        uint16_t bg[64];
+        size_t length;
+        bool selected = mode_index == s->control.menu_index;
+        bool active = mode_index == (uint8_t)s->control.mode;
+
+        snprintf(line, sizeof(line), "%c %s", active ? '*' : ' ', mode_menu_name((app_mode_t)mode_index));
+        length = strlen(line);
+        fill_text_colors(fg, bg, 64U);
+
+        for (size_t i = 0U; i < length; ++i) {
+            fg[i] = active ? COLOR_GREEN : COLOR_WHITE;
+            bg[i] = COLOR_BLACK;
+        }
+        if (selected) {
+            mark_range(fg, bg, 0U, length, COLOR_BLACK, COLOR_YELLOW);
+        }
+
+        bool selection_changed_here = mode_index == s->control.menu_index ||
+                                      mode_index == previous_selected;
+        bool active_changed_here = mode_index == (uint8_t)s->control.mode ||
+                                   mode_index == (uint8_t)previous_active;
+
+        if (force ||
+            top != previous_top ||
+            selection_changed_here ||
+            active_changed_here ||
+            strcmp(previous_lines[row], line) != 0) {
+            draw_rich_text(18, 5 + (int)row * row_height, line, &roboto_18, fg, bg);
+            snprintf(previous_lines[row], sizeof(previous_lines[row]), "%s", line);
+        }
+    }
+
+    draw_mode_menu_scroll_indicator(s->control.menu_index, visible_rows);
+
+    previous_top = top;
+    previous_selected = s->control.menu_index;
+    previous_active = s->control.mode;
+}
+
 /* draw_status_line
  * Inputs: app state.
  * Returns: none.
- * Does: draws compact I2C/device health. TPS OK is the visible sign that
- * TPS55289 answers on I2C.
+ * Does: draws the bottom power summary line for the power-supply screen.
  */
 static void draw_status_line(int y, const app_state_t *s)
 {
@@ -701,25 +1045,40 @@ static void draw_status_line(int y, const app_state_t *s)
     uint16_t fg[64];
     uint16_t bg[64];
     size_t pos = 0U;
+    uint32_t input_mv = (s->analog.adc_mv * 19U + 1U) / 2U;
+    uint32_t input_tenths = (input_mv + 50U) / 100U;
+    int64_t power_mw = channel_power_mw('A', &s->ina238.channel[0]) +
+                       channel_power_mw('B', &s->ina238.channel[1]);
+    int64_t abs_power_mw = power_mw < 0 ? -power_mw : power_mw;
+    int64_t power_tenths = (abs_power_mw + 50LL) / 100LL;
 
     fill_text_colors(fg, bg, 64U);
-    append_colored(line, fg, bg, &pos, "TPS ", COLOR_GRAY);
-    append_colored(line, fg, bg, &pos,
-                   (s->tps55289.status_valid && s->tps55289.limit_valid) ? "OK " : "ERR ",
-                   (s->tps55289.status_valid && s->tps55289.limit_valid) ? COLOR_GREEN : COLOR_RED);
-    if (s->tps55289.status_valid) append_format_colored(line, fg, bg, &pos, COLOR_GRAY, "S%02X ", s->tps55289.status);
-    else append_colored(line, fg, bg, &pos, "S-- ", COLOR_RED);
-    if (s->tps55289.limit_valid) append_format_colored(line, fg, bg, &pos, COLOR_YELLOW, "L%02X  ", s->tps55289.limit_reg);
-    else append_colored(line, fg, bg, &pos, "L--  ", COLOR_RED);
 
-    append_colored(line, fg, bg, &pos, "LM ", COLOR_GRAY);
-    append_colored(line, fg, bg, &pos,
-                   (s->lm51772.status_valid && s->lm51772.limit_valid) ? "OK " : "ERR ",
-                   (s->lm51772.status_valid && s->lm51772.limit_valid) ? COLOR_GREEN : COLOR_RED);
-    if (s->lm51772.status_valid) append_format_colored(line, fg, bg, &pos, COLOR_GRAY, "S%02X ", s->lm51772.status);
-    else append_colored(line, fg, bg, &pos, "S-- ", COLOR_RED);
-    if (s->lm51772.limit_valid) append_format_colored(line, fg, bg, &pos, COLOR_YELLOW, "L%02X", s->lm51772.limit_reg);
-    else append_colored(line, fg, bg, &pos, "L--", COLOR_RED);
+    append_format_colored(line, fg, bg, &pos, COLOR_GRAY,
+                          "In %02lu.%01luV, ",
+                          (unsigned long)(input_tenths / 10U),
+                          (unsigned long)(input_tenths % 10U));
+
+    append_colored(line, fg, bg, &pos, "A ", COLOR_ORANGE);
+    if (s->tps55289.status_valid) {
+        append_format_colored(line, fg, bg, &pos, COLOR_GRAY, "0x%02X, ", s->tps55289.status);
+    } else {
+        append_colored(line, fg, bg, &pos, "0x--, ", COLOR_RED);
+    }
+
+    append_colored(line, fg, bg, &pos, "B ", COLOR_ORANGE);
+    if (s->lm51772.status_valid) {
+        append_format_colored(line, fg, bg, &pos, COLOR_GRAY, "0x%02X, ", s->lm51772.status);
+    } else {
+        append_colored(line, fg, bg, &pos, "0x--, ", COLOR_RED);
+    }
+
+    append_colored(line, fg, bg, &pos, "P ", COLOR_GRAY);
+    append_format_colored(line, fg, bg, &pos, COLOR_YELLOW,
+                          "%s%lld.%01lldW",
+                          power_mw < 0 ? "-" : "",
+                          (long long)(power_tenths / 10LL),
+                          (long long)(power_tenths % 10LL));
 
     draw_rich_text(2, y, line, &roboto_18, fg, bg);
 }
@@ -792,7 +1151,8 @@ esp_err_t display_init(void)
     gpio_set_level(TFT_SCLK_GPIO, 0);
     gpio_set_level(TFT_MOSI_GPIO, 0);
     gpio_set_level(TFT_RESET_GPIO, 1);
-    backlight_set(true);
+    gpio_set_level(TFT_BACKLIGHT_GPIO, !TFT_BACKLIGHT_ACTIVE_LEVEL);
+    ESP_RETURN_ON_ERROR(backlight_pwm_init(), TAG, "backlight init");
     log_pin_levels("after gpio defaults");
 #if RGB_LED_ENABLED
     gpio_set_level(RGB_RED_GPIO, !RGB_ACTIVE_LEVEL);
@@ -841,23 +1201,18 @@ esp_err_t display_init(void)
     ESP_LOGI(TAG, "cmd SLPOUT");
     command(0x11);
     vTaskDelay(pdMS_TO_TICKS(120));
-    ESP_LOGI(TAG, "cmd COLMOD/MADCTL/NORON/DISPON");
+    ESP_LOGI(TAG, "cmd COLMOD/MADCTL/INVOFF/NORON/DISPON");
     const uint8_t format[] = {0x55}; command_data(0x3A, format, sizeof(format));
     const uint8_t madctl[] = {0xA0}; command_data(0x36, madctl, sizeof(madctl));
+    command(0x20);
     command(0x13);
     command(0x29);
     log_pin_levels("after display on");
 
-    ESP_LOGI(TAG, "draw color bars");
-    fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT / 3, COLOR_RED);
-    fill_rect(0, TFT_HEIGHT / 3, TFT_WIDTH, TFT_HEIGHT / 3, COLOR_GREEN);
-    fill_rect(0, (TFT_HEIGHT / 3) * 2, TFT_WIDTH,
-              TFT_HEIGHT - (TFT_HEIGHT / 3) * 2, COLOR_BLUE);
-    vTaskDelay(pdMS_TO_TICKS(350));
-    fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
-    draw_text(8, 30, "LOGIC", &roboto_30, COLOR_GREEN);
-    draw_text(8, 72, "PROBE", &roboto_30, COLOR_GREEN);
-    draw_text(8, 126, "STARTING", &roboto_18, COLOR_WHITE);
+    ESP_LOGI(TAG, "draw startup splash");
+    draw_splash_bitmap();
+    backlight_fade_in();
+    vTaskDelay(pdMS_TO_TICKS(TFT_SPLASH_VISIBLE_MS - TFT_BACKLIGHT_FADE_MS));
     ESP_LOGI(TAG, "init done");
     return ESP_OK;
 }
@@ -906,11 +1261,36 @@ void display_render(const app_state_t *s)
     static char previous_ch_a[64] = "";
     static char previous_ch_b[64] = "";
     static char previous_limits[64] = "";
-    static char previous_mode_screen[192] = "";
+    static char previous_mode_screen[256] = "";
     static app_mode_t previous_mode = APP_MODE_COUNT;
+    static bool previous_menu_open;
+    static uint8_t previous_menu_index = 0xFFU;
     static bool psu_screen_initialized;
     char line[64];
-    char mode_line[192];
+    char mode_line[256];
+
+    if (previous_menu_open != s->control.menu_open) {
+        fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
+        previous_ch_a[0] = '\0';
+        previous_ch_b[0] = '\0';
+        previous_limits[0] = '\0';
+        previous_mode_screen[0] = '\0';
+        psu_screen_initialized = false;
+        previous_mode = APP_MODE_COUNT;
+        previous_menu_index = 0xFFU;
+        previous_menu_open = s->control.menu_open;
+    }
+
+    if (s->control.menu_open) {
+        if (previous_menu_index != s->control.menu_index ||
+            previous_mode != s->control.mode) {
+            draw_mode_menu(s, previous_menu_index == 0xFFU);
+            previous_menu_index = s->control.menu_index;
+            previous_mode = s->control.mode;
+        }
+        display_set_rgb(s->analog.logic_state);
+        return;
+    }
 
     if (previous_mode != s->control.mode) {
         fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
@@ -927,7 +1307,7 @@ void display_render(const app_state_t *s)
         snprintf(previous_ch_b, sizeof(previous_ch_b), "%s", "");
         snprintf(previous_limits, sizeof(previous_limits), "%s", "");
 
-        snprintf(mode_line, sizeof(mode_line), "M%u S%u D%u F%lu P%u O%u U%lu R%lu C%lu A%u%lu%ld B%u%lu%ld",
+        snprintf(mode_line, sizeof(mode_line), "M%u S%u D%u F%lu P%u O%u U%lu R%lu C%lu OC%u OH%u OP%u V%u T%s|%s|%s UE%lu I%s|%s|%s IP%lu IE%lu A%u%lu%ld B%u%lu%ld",
                  (unsigned)s->control.mode,
                  (unsigned)s->control.selected_value,
                  (unsigned)s->control.selected_digit,
@@ -937,6 +1317,19 @@ void display_render(const app_state_t *s)
                  (unsigned long)s->control.uart_baud,
                  (unsigned long)s->control.rs485_baud,
                  (unsigned long)s->control.can_bitrate,
+                 s->control.overcurrent_cc ? 1U : 0U,
+                 (unsigned)s->control.overheat_c,
+                 (unsigned)s->control.overpower_w,
+                 (unsigned)s->control.volume_percent,
+                 (s->control.mode == APP_MODE_UART || s->control.mode == APP_MODE_RS485) ? s->uart.lines[0] : "",
+                 (s->control.mode == APP_MODE_UART || s->control.mode == APP_MODE_RS485) ? s->uart.lines[1] : "",
+                 (s->control.mode == APP_MODE_UART || s->control.mode == APP_MODE_RS485) ? s->uart.lines[2] : "",
+                 (unsigned long)s->uart.errors,
+                 s->control.mode == APP_MODE_I2C ? s->i2c_sniffer.lines[0] : "",
+                 s->control.mode == APP_MODE_I2C ? s->i2c_sniffer.lines[1] : "",
+                 s->control.mode == APP_MODE_I2C ? s->i2c_sniffer.lines[2] : "",
+                 (unsigned long)s->i2c_sniffer.packets,
+                 (unsigned long)s->i2c_sniffer.errors,
                  s->ina238.channel[0].valid ? 1U : 0U,
                  (unsigned long)s->ina238.channel[0].bus_mv,
                  (long)s->ina238.channel[0].shunt_uv,
@@ -949,24 +1342,27 @@ void display_render(const app_state_t *s)
                     draw_generator_screen(s);
                     break;
                 case APP_MODE_UART:
-                    draw_protocol_screen(s, "UART", s->control.uart_baud, "", CONTROL_SELECT_UART_BAUD);
+                    draw_serial_screen(s, "UART", s->control.uart_baud, CONTROL_SELECT_UART_BAUD);
                     break;
                 case APP_MODE_1WIRE:
                     draw_reserved_screen(s, "1WIRE");
                     break;
                 case APP_MODE_RS485:
-                    draw_protocol_screen(s, "RS485", s->control.rs485_baud, "", CONTROL_SELECT_RS485_BAUD);
+                    draw_serial_screen(s, "RS485", s->control.rs485_baud, CONTROL_SELECT_RS485_BAUD);
                     break;
                 case APP_MODE_CAN:
                     draw_can_screen(s);
                     break;
                 case APP_MODE_I2C:
-                    draw_reserved_screen(s, "I2C");
+                    draw_i2c_sniffer_screen(s);
+                    break;
+                case APP_MODE_SETTING:
+                    draw_setting_screen(s);
                     break;
                 default:
                     break;
             }
-            snprintf(previous_mode_screen, sizeof(previous_mode_screen), "%s", mode_line);
+            memcpy(previous_mode_screen, mode_line, sizeof(previous_mode_screen));
         }
         display_set_rgb(s->analog.logic_state);
         return;
@@ -980,23 +1376,26 @@ void display_render(const app_state_t *s)
         psu_screen_initialized = true;
     }
 
-    snprintf(line, sizeof(line), "TPS%u%u%02X%02X LM%u%u%02X%02X",
+    snprintf(line, sizeof(line), "IN%lu A%u%02X B%u%02X PA%u%lu%ld PB%u%lu%ld",
+             (unsigned long)s->analog.adc_mv,
              s->tps55289.status_valid ? 1U : 0U,
-             s->tps55289.limit_valid ? 1U : 0U,
              s->tps55289.status,
-             s->tps55289.limit_reg,
              s->lm51772.status_valid ? 1U : 0U,
-             s->lm51772.limit_valid ? 1U : 0U,
              s->lm51772.status,
-             s->lm51772.limit_reg);
+             s->ina238.channel[0].valid ? 1U : 0U,
+             (unsigned long)s->ina238.channel[0].bus_mv,
+             (long)s->ina238.channel[0].shunt_uv,
+             s->ina238.channel[1].valid ? 1U : 0U,
+             (unsigned long)s->ina238.channel[1].bus_mv,
+             (long)s->ina238.channel[1].shunt_uv);
     if (strcmp(previous_limits, line) != 0) {
-        draw_status_line(8, s);
+        draw_status_line(146, s);
         snprintf(previous_limits, sizeof(previous_limits), "%s", line);
     }
 
     const app_ina238_channel_t *ina = &s->ina238.channel[0];
     if (ina->valid) {
-        snprintf(line, sizeof(line), "A%lu%ld%u%u%u%ld%u%u",
+        snprintf(line, sizeof(line), "A%lu%ld%u%u%u%ld%u%u%u",
                  (unsigned long)ina->bus_mv,
                  (long)ina->shunt_uv,
                  (unsigned)ina->wide_range,
@@ -1004,17 +1403,19 @@ void display_render(const app_state_t *s)
                  (unsigned)s->control.i2_ma,
                  (long)ina->temperature_mc,
                  (unsigned)s->control.selected_value,
-                 (unsigned)s->control.selected_digit);
+                 (unsigned)s->control.selected_digit,
+                 s->tps55289.current_limit_active ? 1U : 0U);
     } else {
-        snprintf(line, sizeof(line), "A--%u%u%u%u",
+        snprintf(line, sizeof(line), "A--%u%u%u%u%u",
                  (unsigned)s->control.u2_mv,
                  (unsigned)s->control.i2_ma,
                  (unsigned)s->control.selected_value,
-                 (unsigned)s->control.selected_digit);
+                 (unsigned)s->control.selected_digit,
+                 s->tps55289.current_limit_active ? 1U : 0U);
     }
     if (strcmp(previous_ch_a, line) != 0) {
-        draw_channel_actual_line(34, 'A', ina);
-        draw_channel_set_line(70, s->control.u2_mv, s->control.i2_ma, ina,
+        draw_channel_actual_line(2, 'A', ina, s->tps55289.current_limit_active);
+        draw_channel_set_line(40, s->control.u2_mv, s->control.i2_ma, ina,
                               2U, 3U,
                               s->control.selected_value,
                               s->control.selected_digit);
@@ -1023,7 +1424,7 @@ void display_render(const app_state_t *s)
 
     ina = &s->ina238.channel[1];
     if (ina->valid) {
-        snprintf(line, sizeof(line), "B%lu%ld%u%u%u%ld%u%u",
+        snprintf(line, sizeof(line), "B%lu%ld%u%u%u%ld%u%u%u",
                  (unsigned long)ina->bus_mv,
                  (long)ina->shunt_uv,
                  (unsigned)ina->wide_range,
@@ -1031,17 +1432,19 @@ void display_render(const app_state_t *s)
                  (unsigned)s->control.i1_ma,
                  (long)ina->temperature_mc,
                  (unsigned)s->control.selected_value,
-                 (unsigned)s->control.selected_digit);
+                 (unsigned)s->control.selected_digit,
+                 s->lm51772.current_limit_active ? 1U : 0U);
     } else {
-        snprintf(line, sizeof(line), "B--%u%u%u%u",
+        snprintf(line, sizeof(line), "B--%u%u%u%u%u",
                  (unsigned)s->control.u1_mv,
                  (unsigned)s->control.i1_ma,
                  (unsigned)s->control.selected_value,
-                 (unsigned)s->control.selected_digit);
+                 (unsigned)s->control.selected_digit,
+                 s->lm51772.current_limit_active ? 1U : 0U);
     }
     if (strcmp(previous_ch_b, line) != 0) {
-        draw_channel_actual_line(104, 'B', ina);
-        draw_channel_set_line(140, s->control.u1_mv, s->control.i1_ma, ina,
+        draw_channel_actual_line(72, 'B', ina, s->lm51772.current_limit_active);
+        draw_channel_set_line(110, s->control.u1_mv, s->control.i1_ma, ina,
                               0U, 1U,
                               s->control.selected_value,
                               s->control.selected_digit);

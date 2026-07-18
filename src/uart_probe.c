@@ -3,20 +3,37 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include "bluetooth_spp.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_check.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "probe_config.h"
 
 #define UART_A_PORT UART_NUM_1
+#define UART_RX_LINE_CHARS 128U
+#define RS485_DISPLAY_BYTES_WITH_ELLIPSIS 4U
+#define RS485_PACKET_TIMEOUT_MIN_US 2000LL
 
 static portMUX_TYPE s_uart_text_lock = portMUX_INITIALIZER_UNLOCKED;
 static char s_uart_a_text[UART_DISPLAY_CHARS + 1U] = "";
+static char s_uart_a_lines[3][UART_DISPLAY_CHARS + 1U] = {{0}};
+static char s_uart_bt_out[UART_RX_LINE_CHARS * 3U + 16U];
 static uint32_t s_uart_a_errors;
 static QueueHandle_t s_uart_a_event_queue;
+static bool s_uart_ready;
+static volatile app_mode_t s_active_mode = APP_MODE_POWER_SUPPLY;
+static volatile uint32_t s_active_baud = UART_TEST_BAUD;
+
+static int64_t rs485_packet_timeout_us(void)
+{
+    uint32_t baud = s_active_baud == 0U ? UART_TEST_BAUD : s_active_baud;
+    int64_t timeout = (int64_t)((40ULL * 1000000ULL + baud - 1ULL) / baud);
+    return timeout < RS485_PACKET_TIMEOUT_MIN_US ? RS485_PACKET_TIMEOUT_MIN_US : timeout;
+}
 
 /* uart_preview_store
  * Inputs:
@@ -26,9 +43,97 @@ static QueueHandle_t s_uart_a_event_queue;
  */
 static void uart_preview_store(const char *line)
 {
+    size_t length = strlen(line);
+    if (length > UART_DISPLAY_CHARS) length = UART_DISPLAY_CHARS;
+
     portENTER_CRITICAL(&s_uart_text_lock);
-    snprintf(s_uart_a_text, sizeof(s_uart_a_text), "%s", line);
+    memcpy(s_uart_a_lines[0], s_uart_a_lines[1], sizeof(s_uart_a_lines[0]));
+    memcpy(s_uart_a_lines[1], s_uart_a_lines[2], sizeof(s_uart_a_lines[1]));
+    memcpy(s_uart_a_lines[2], line, length);
+    s_uart_a_lines[2][length] = '\0';
+    memcpy(s_uart_a_text, line, length + 1U);
     portEXIT_CRITICAL(&s_uart_text_lock);
+}
+
+static void uart_line_store_and_forward(const char *line, bool truncated)
+{
+    char preview[UART_DISPLAY_CHARS + 1U];
+    size_t length = strlen(line);
+
+    if (length > UART_PREVIEW_CHARS || truncated) {
+        memcpy(preview, line, UART_PREVIEW_CHARS);
+        memcpy(preview + UART_PREVIEW_CHARS, "...", 4U);
+    } else {
+        memcpy(preview, line, length + 1U);
+    }
+    uart_preview_store(preview);
+
+    if (s_active_mode == APP_MODE_UART && bluetooth_spp_connected()) {
+        char out[UART_RX_LINE_CHARS + 16U];
+        int written = snprintf(out, sizeof(out), "[UART]%s\r\n", line);
+        if (written > 0) {
+            size_t length = (size_t)written;
+            if (length >= sizeof(out)) length = sizeof(out) - 1U;
+            bluetooth_spp_write(out, length);
+        }
+    }
+}
+
+static void rs485_format_display(const uint8_t *data, size_t length, bool truncated, char *out, size_t out_size)
+{
+    size_t bytes_to_show = length;
+    size_t used = 0U;
+    bool ellipsis = truncated || length > 5U;
+
+    if (ellipsis && bytes_to_show > RS485_DISPLAY_BYTES_WITH_ELLIPSIS) {
+        bytes_to_show = RS485_DISPLAY_BYTES_WITH_ELLIPSIS;
+    }
+
+    if (out_size == 0U) return;
+    out[0] = '\0';
+    for (size_t i = 0U; i < bytes_to_show && used + 3U < out_size; ++i) {
+        int written = snprintf(out + used,
+                               out_size - used,
+                               i == 0U ? "%02X" : " %02X",
+                               data[i]);
+        if (written <= 0) break;
+        used += (size_t)written;
+    }
+    if (ellipsis && used + 5U <= out_size) {
+        memcpy(out + used, " ...", 5U);
+    }
+}
+
+static void rs485_packet_store_and_forward(const uint8_t *data, size_t length, bool truncated)
+{
+    char preview[UART_DISPLAY_CHARS + 1U];
+    size_t used;
+
+    if (length == 0U) return;
+    rs485_format_display(data, length, truncated, preview, sizeof(preview));
+    uart_preview_store(preview);
+
+    if (s_active_mode != APP_MODE_RS485 || !bluetooth_spp_connected()) return;
+
+    used = (size_t)snprintf(s_uart_bt_out, sizeof(s_uart_bt_out), "[485]");
+    for (size_t i = 0U; i < length && used + 4U < sizeof(s_uart_bt_out); ++i) {
+        int written = snprintf(s_uart_bt_out + used,
+                               sizeof(s_uart_bt_out) - used,
+                               "%s%02X",
+                               i == 0U ? "" : " ",
+                               data[i]);
+        if (written <= 0) break;
+        used += (size_t)written;
+    }
+    if (truncated && used + 4U < sizeof(s_uart_bt_out)) {
+        memcpy(s_uart_bt_out + used, " ...", 4U);
+        used += 4U;
+    }
+    if (used + 2U < sizeof(s_uart_bt_out)) {
+        memcpy(s_uart_bt_out + used, "\r\n", 2U);
+        used += 2U;
+    }
+    bluetooth_spp_write(s_uart_bt_out, used);
 }
 
 /* uart_error_add
@@ -48,7 +153,7 @@ static void uart_error_add(uint32_t count)
  * Inputs:
  *   type - UART driver event type reported for UART A.
  * Returns: true when the event is caused by a normal probe LOW state.
- * Does: suppresses BREAK/framing artifacts that appear when IO22 is shorted
+ * Does: suppresses BREAK/framing artifacts that appear when UART RX is shorted
  * to ground and therefore should be interpreted as logic LOW, not UART fault.
  */
 static bool uart_error_is_static_low_artifact(uart_event_type_t type)
@@ -68,14 +173,36 @@ static bool uart_error_is_static_low_artifact(uart_event_type_t type)
 static void uart_a_rx_task(void *argument)
 {
     (void)argument;
-    char line[UART_DISPLAY_CHARS + 1U] = "";
+    char line[UART_RX_LINE_CHARS + 1U] = "";
+    uint8_t packet[UART_RX_LINE_CHARS] = {0};
     size_t used = 0U;
+    size_t packet_used = 0U;
+    bool truncated = false;
+    bool packet_truncated = false;
+    int64_t last_rs485_byte_us = 0;
+    app_mode_t observed_mode = s_active_mode;
     uart_event_t event;
     uint8_t bytes[64];
 
     while (true) {
-        if (xQueueReceive(s_uart_a_event_queue, &event, pdMS_TO_TICKS(250)) != pdTRUE)
+        if (observed_mode != s_active_mode) {
+            observed_mode = s_active_mode;
+            used = 0U;
+            packet_used = 0U;
+            truncated = false;
+            packet_truncated = false;
+        }
+
+        if (xQueueReceive(s_uart_a_event_queue, &event, pdMS_TO_TICKS(1)) != pdTRUE) {
+            if (s_active_mode == APP_MODE_RS485 &&
+                packet_used != 0U &&
+                esp_timer_get_time() - last_rs485_byte_us >= rs485_packet_timeout_us()) {
+                rs485_packet_store_and_forward(packet, packet_used, packet_truncated);
+                packet_used = 0U;
+                packet_truncated = false;
+            }
             continue;
+        }
 
         switch (event.type) {
             case UART_DATA: {
@@ -88,20 +215,32 @@ static void uart_a_rx_task(void *argument)
 
                     for (int i = 0; i < count; ++i) {
                         uint8_t byte = bytes[i];
+                        if (s_active_mode == APP_MODE_RS485) {
+                            if (packet_used < sizeof(packet)) {
+                                packet[packet_used++] = byte;
+                            } else {
+                                packet_truncated = true;
+                            }
+                            last_rs485_byte_us = esp_timer_get_time();
+                            continue;
+                        }
+
                         if (byte == '\r' || byte == '\n') {
                             if (used != 0U) {
                                 line[used] = '\0';
-                                uart_preview_store(line);
+                                uart_line_store_and_forward(line, truncated);
                                 used = 0U;
+                                truncated = false;
                             }
                             continue;
                         }
 
-                        if (used < UART_DISPLAY_CHARS) {
+                        if (used < UART_RX_LINE_CHARS) {
                             line[used++] = (char)byte;
                             line[used] = '\0';
+                        } else {
+                            truncated = true;
                         }
-                        if (used == UART_DISPLAY_CHARS) uart_preview_store(line);
                     }
                 }
                 break;
@@ -113,6 +252,9 @@ static void uart_a_rx_task(void *argument)
                 uart_flush_input(UART_A_PORT);
                 xQueueReset(s_uart_a_event_queue);
                 used = 0U;
+                packet_used = 0U;
+                truncated = false;
+                packet_truncated = false;
                 break;
 
             case UART_PARITY_ERR:
@@ -127,10 +269,24 @@ static void uart_a_rx_task(void *argument)
     }
 }
 
+static void uart_a_tx_task(void *argument)
+{
+    (void)argument;
+    uint32_t counter = 0U;
+    char line[20];
+
+    while (true) {
+        int length = snprintf(line, sizeof(line), "Test%lu\r\n", (unsigned long)counter);
+        if (s_active_mode == APP_MODE_UART && length > 0) uart_probe_write_bytes(line, (size_t)length);
+        counter = counter >= 100U ? 0U : counter + 1U;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 /* uart_probe_init
  * Inputs: none.
  * Returns: ESP_OK on success, or an ESP-IDF error from UART setup.
- * Does: initializes UART A RX on IO22 and starts the RX preview task.
+ * Does: initializes UART A on IO18/IO19 and starts RX preview plus test TX.
  */
 esp_err_t uart_probe_init(void)
 {
@@ -143,15 +299,51 @@ esp_err_t uart_probe_init(void)
         .source_clk = UART_SCLK_DEFAULT
     };
 
-    ESP_RETURN_ON_ERROR(uart_driver_install(UART_A_PORT, 1024, 0, 20, &s_uart_a_event_queue, 0),
+    ESP_RETURN_ON_ERROR(uart_driver_install(UART_A_PORT, 1024, 256, 20, &s_uart_a_event_queue, 0),
                         "uart_probe", "install UART A");
     ESP_RETURN_ON_ERROR(uart_param_config(UART_A_PORT, &config), "uart_probe", "config UART A");
-    ESP_RETURN_ON_ERROR(uart_set_pin(UART_A_PORT, UART_PIN_NO_CHANGE, UART_A_RX_GPIO,
+    ESP_RETURN_ON_ERROR(uart_set_pin(UART_A_PORT, UART_A_TX_GPIO, UART_A_RX_GPIO,
                                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),
                         "uart_probe", "pins UART A");
 
-    xTaskCreate(uart_a_rx_task, "uart_a_rx", 3072, NULL, 5, NULL);
+    xTaskCreate(uart_a_rx_task, "uart_a_rx", 4096, NULL, 5, NULL);
+    s_uart_ready = true;
+    xTaskCreate(uart_a_tx_task, "uart_a_tx", 2048, NULL, 4, NULL);
     return ESP_OK;
+}
+
+void uart_probe_configure(app_mode_t mode, uint32_t uart_baud, uint32_t rs485_baud)
+{
+    uint32_t baud = mode == APP_MODE_RS485 ? rs485_baud : uart_baud;
+
+    if (mode != APP_MODE_UART && mode != APP_MODE_RS485) {
+        if (mode != s_active_mode) {
+            portENTER_CRITICAL(&s_uart_text_lock);
+            memset(s_uart_a_lines, 0, sizeof(s_uart_a_lines));
+            s_uart_a_text[0] = '\0';
+            portEXIT_CRITICAL(&s_uart_text_lock);
+            s_active_mode = mode;
+        }
+        return;
+    }
+
+    if (baud == 0U) baud = UART_TEST_BAUD;
+    if (s_uart_ready && baud != s_active_baud) {
+        if (uart_wait_tx_done(UART_A_PORT, pdMS_TO_TICKS(20)) == ESP_OK &&
+            uart_set_baudrate(UART_A_PORT, baud) == ESP_OK) {
+            s_active_baud = baud;
+        }
+    } else if (!s_uart_ready) {
+        s_active_baud = baud;
+    }
+
+    if (mode != s_active_mode) {
+        portENTER_CRITICAL(&s_uart_text_lock);
+        memset(s_uart_a_lines, 0, sizeof(s_uart_a_lines));
+        s_uart_a_text[0] = '\0';
+        portEXIT_CRITICAL(&s_uart_text_lock);
+        s_active_mode = mode;
+    }
 }
 
 /* uart_probe_update
@@ -164,7 +356,14 @@ void uart_probe_update(app_state_t *state)
 {
     if (state == NULL) return;
     portENTER_CRITICAL(&s_uart_text_lock);
-    snprintf(state->uart.text, sizeof(state->uart.text), "%s", s_uart_a_text);
+    memcpy(state->uart.text, s_uart_a_text, sizeof(state->uart.text));
+    memcpy(state->uart.lines, s_uart_a_lines, sizeof(state->uart.lines));
     state->uart.errors = s_uart_a_errors;
     portEXIT_CRITICAL(&s_uart_text_lock);
+}
+
+void uart_probe_write_bytes(const char *data, size_t length)
+{
+    if (!s_uart_ready || data == NULL || length == 0U) return;
+    uart_write_bytes(UART_A_PORT, data, length);
 }

@@ -11,6 +11,8 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "i2c_bus.h"
+#include "i2c_i2s_sniffer.h"
+#include "i2c_sniffer.h"
 #include "i2c_worker.h"
 #include "ina238_monitor.h"
 #include "io26_diag.h"
@@ -42,10 +44,6 @@
  *   every UI_PERIOD_MS:
  *     - display_render()
  *       Draws only from the local snapshot.  The display does not read hardware.
- *
- *   every TELEMETRY_PERIOD_MS:
- *     - format_snapshot()
- *       Formats one diagnostic line for USB UART and Bluetooth.
  *
  *   every loop:
  *     - queued command processing.
@@ -90,17 +88,29 @@ static char s_command_line[32];
 static size_t s_command_line_used;
 static int64_t s_command_line_last_us;
 static app_state_t s_state;
+static bool s_i2c_i2s_sniffer_active;
 
-/* queue_command
+/* enqueue_command
  * Inputs:
  *   command - one command byte received from Bluetooth or USB UART.
  * Returns: none.
  * Does: places the command into the main-loop queue so command handling never
  * runs inside a Bluetooth callback or blocking input task.
  */
-static void queue_command(char command)
+static void enqueue_command(char command)
 {
     if (s_commands != NULL) xQueueSend(s_commands, &command, pdMS_TO_TICKS(10));
+}
+
+static void bluetooth_command(char command)
+{
+#if UART_PROBE_ENABLED
+    if (s_state.control.mode == APP_MODE_UART || s_state.control.mode == APP_MODE_RS485) {
+        uart_probe_write_bytes(&command, 1U);
+        return;
+    }
+#endif
+    enqueue_command(command);
 }
 
 /* uart_command_task
@@ -115,49 +125,9 @@ static void uart_command_task(void *argument)
     (void)argument;
     while (true) {
         int ch = getchar();
-        if (ch != EOF) queue_command((char)ch);
+        if (ch != EOF) enqueue_command((char)ch);
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-}
-
-/* format_snapshot
- * Inputs:
- *   buffer - destination text buffer; must not be NULL.
- *   size   - destination buffer size in bytes.
- *   s      - complete measurement snapshot to format; must not be NULL.
- * Returns: none.
- * Does: creates one CSV-like diagnostic line for USB UART/Bluetooth logs.
- */
-static void format_snapshot(char *buffer, size_t size, const app_state_t *s)
-{
-    snprintf(buffer, size,
-        "state=%s,adc=%lu,mV=%lu,vpp=%lu,bias_nA=%ld,test=%lu,open=%u,freq=%.3f,duty=%.2f,"
-        "period_us=%lu,edges=%lu,event=%s,missing=%u,uart=\"%s\",uart_err=%lu,"
-        "ina1_valid=%u,ina1_mv=%lu,ina1_ma=%ld,ina1_temp_mc=%ld,"
-        "ina2_valid=%u,ina2_mv=%lu,ina2_ma=%ld,ina2_temp_mc=%ld\r\n",
-        app_logic_state_name(s->analog.logic_state),
-        (unsigned long)s->analog.adc_mv,
-        (unsigned long)s->analog.voltage_mv,
-        (unsigned long)s->analog.vpp_mv,
-        (long)s->analog.bias_current_na,
-        (unsigned long)s->analog.test_span_mv,
-        s->analog.test_visible,
-        (double)s->timing.frequency_hz,
-        (double)s->timing.duty_percent,
-        (unsigned long)s->timing.period_us,
-        (unsigned long)s->timing.edge_count,
-        s->timing.event_visible ? app_event_name(s->timing.event) : "",
-        s->timing.signal_missing,
-        s->uart.text,
-        (unsigned long)s->uart.errors,
-        s->ina238.channel[0].valid,
-        (unsigned long)s->ina238.channel[0].bus_mv,
-        (long)s->ina238.channel[0].current_ma,
-        (long)s->ina238.channel[0].temperature_mc,
-        s->ina238.channel[1].valid,
-        (unsigned long)s->ina238.channel[1].bus_mv,
-        (long)s->ina238.channel[1].current_ma,
-        (long)s->ina238.channel[1].temperature_mc);
 }
 
 /* process_command_line
@@ -321,9 +291,21 @@ void app_main(void)
     ESP_ERROR_CHECK(io26_diag_init());
     ESP_LOGI(TAG, "io26_diag_init end");
 #endif
-#if UART_PROBE_ENABLED
+#if UART_PROBE_ENABLED && !I2C_SNIFFER_OWNS_UART_PINS
     ESP_LOGI(TAG, "uart_probe_init");
     ESP_ERROR_CHECK(uart_probe_init());
+#endif
+#if I2C_SNIFFER_ENABLED
+    ESP_LOGI(TAG, "i2c_i2s_sniffer_init");
+    esp_err_t i2c_i2s_sniffer_result = i2c_i2s_sniffer_init();
+    if (i2c_i2s_sniffer_result == ESP_OK) {
+        s_i2c_i2s_sniffer_active = true;
+    } else {
+        ESP_LOGW(TAG,
+                 "i2c_i2s_sniffer_init failed: %s, falling back to gpio sniffer",
+                 esp_err_to_name(i2c_i2s_sniffer_result));
+        ESP_ERROR_CHECK(i2c_sniffer_init());
+    }
 #endif
     ESP_LOGI(TAG, "control_init begin");
     ESP_ERROR_CHECK(control_init());
@@ -341,13 +323,11 @@ void app_main(void)
     ESP_ERROR_CHECK(i2c_worker_start(&s_state));
     ESP_LOGI(TAG, "i2c_worker_start end");
 
-    esp_err_t bt_result = bluetooth_spp_init(queue_command);
+    esp_err_t bt_result = bluetooth_spp_init(bluetooth_command);
     if (bt_result != ESP_OK) ESP_LOGE(TAG, "Bluetooth init: %s", esp_err_to_name(bt_result));
     else ESP_LOGI(TAG, "Bluetooth device: %s", BLUETOOTH_DEVICE_NAME);
 
     int64_t last_ui_us = 0;
-    int64_t last_telemetry_us = 0;
-
     display_black();
     ESP_LOGI(TAG, "enter main loop");
 
@@ -359,24 +339,26 @@ void app_main(void)
 #if ANALOG_PROBE_ENABLED
         analog_probe_update(&s_state, false);
 #endif
-#if UART_PROBE_ENABLED
+        control_update(&s_state);
+#if UART_PROBE_ENABLED && !I2C_SNIFFER_OWNS_UART_PINS
+        uart_probe_configure(s_state.control.mode, s_state.control.uart_baud, s_state.control.rs485_baud);
         uart_probe_update(&s_state);
 #endif
-        control_update(&s_state);
+#if I2C_SNIFFER_ENABLED
+        if (s_i2c_i2s_sniffer_active) {
+            i2c_i2s_sniffer_configure(s_state.control.mode);
+            i2c_i2s_sniffer_update(&s_state);
+        } else {
+            i2c_sniffer_configure(s_state.control.mode);
+            i2c_sniffer_update(&s_state);
+        }
+#endif
         control_persistence_update(now);
 
         if (now - last_ui_us >= UI_PERIOD_MS * 1000LL) {
             last_ui_us = now;
             display_render(&s_state);
         }
-        if (now - last_telemetry_us >= TELEMETRY_PERIOD_MS * 1000LL) {
-            last_telemetry_us = now;
-            char telemetry[256];
-            format_snapshot(telemetry, sizeof(telemetry), &s_state);
-            printf("%s", telemetry);
-            if (bluetooth_spp_connected()) bluetooth_spp_write(telemetry, strlen(telemetry));
-        }
-
         char command;
         while (xQueueReceive(s_commands, &command, 0) == pdTRUE) process_command_char(command);
         process_buffered_command_if_idle(now);
