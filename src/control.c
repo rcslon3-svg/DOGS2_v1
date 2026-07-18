@@ -42,6 +42,7 @@
 #define CONTROL_U2_MAX_MV 19000U
 #define CONTROL_I1_MAX_MA CHANNEL_B_CURRENT_LIMIT_MAX_MA
 #define CONTROL_I2_MAX_MA 2000U
+#define CONTROL_CURRENT_LIMIT_STEP_MA 50U
 #define CONTROL_OVERHEAT_MIN_C 40U
 #define CONTROL_OVERHEAT_MAX_C 70U
 #define CONTROL_OVERPOWER_MIN_W 50U
@@ -144,12 +145,13 @@ static bool debounce_pressed(bool raw_high,
 /* selected_digit_count
  * Inputs: selected value index.
  * Returns: number of editable decimal digits for that value.
- * Does: voltage has four digits xx.xx, current has three digits x.xx.
+ * Does: voltage has four digits xx.xx. Current limits are selected from the
+ * real converter DAC-code values, so they have one non-digit edit state.
  */
 static uint8_t selected_digit_count(uint8_t selected)
 {
     if (selected == CONTROL_SELECT_U1 || selected == CONTROL_SELECT_U2) return 4U;
-    if (selected == CONTROL_SELECT_I1 || selected == CONTROL_SELECT_I2) return 3U;
+    if (selected == CONTROL_SELECT_I1 || selected == CONTROL_SELECT_I2) return 1U;
     if (selected == CONTROL_SELECT_GEN_FREQ) return 6U;
     if (selected == CONTROL_SELECT_GEN_DUTY) return 2U;
     if (selected == CONTROL_SELECT_OVERCURRENT) return 1U;
@@ -163,18 +165,17 @@ static uint8_t selected_digit_count(uint8_t selected)
  * Returns: one encoder step in mV or mA.
  * Does: maps the highlighted display digit to its natural decimal weight.
  * Voltage digits are xx.xx -> 10 V, 1 V, 0.1 V, 0.01 V.
- * Current digits are x.xx -> 1 A, 0.1 A, 0.01 A.
+ * Current limits step through adjacent 500 uV / 10 mOhm DAC codes: 50 mA.
  */
 static uint16_t selected_step(uint8_t selected, uint8_t digit)
 {
     static const uint16_t voltage_steps[4] = {10000U, 1000U, 100U, 10U};
-    static const uint16_t current_steps[3] = {1000U, 100U, 10U};
 
     if ((selected == CONTROL_SELECT_U1 || selected == CONTROL_SELECT_U2) && digit < 4U) {
         return voltage_steps[digit];
     }
-    if ((selected == CONTROL_SELECT_I1 || selected == CONTROL_SELECT_I2) && digit < 3U) {
-        return current_steps[digit];
+    if ((selected == CONTROL_SELECT_I1 || selected == CONTROL_SELECT_I2) && digit == 0U) {
+        return CONTROL_CURRENT_LIMIT_STEP_MA;
     }
     if (selected == CONTROL_SELECT_OVERHEAT && digit < 2U) {
         static const uint16_t overheat_steps[2] = {10U, 1U};
@@ -241,6 +242,15 @@ static uint16_t clamp_loaded_value(uint16_t value, uint16_t maximum)
     return value > maximum ? maximum : value;
 }
 
+static uint16_t quantize_current_limit(uint16_t value, uint16_t maximum)
+{
+    if (value > maximum) value = maximum;
+    uint16_t quantized = (uint16_t)(((uint32_t)value + CONTROL_CURRENT_LIMIT_STEP_MA / 2U) /
+                                   CONTROL_CURRENT_LIMIT_STEP_MA *
+                                   CONTROL_CURRENT_LIMIT_STEP_MA);
+    return quantized > maximum ? maximum : quantized;
+}
+
 static uint16_t clamp_loaded_value_range(uint16_t value, uint16_t minimum, uint16_t maximum)
 {
     if (value < minimum) return minimum;
@@ -257,9 +267,9 @@ static void load_setpoints(void)
     if (nvs_get_u16(nvs, "u1", &value) == ESP_OK) {
         s_u1_mv = clamp_loaded_value_range(value, CONTROL_U1_MIN_MV, CONTROL_U1_MAX_MV);
     }
-    if (nvs_get_u16(nvs, "i1", &value) == ESP_OK) s_i1_ma = clamp_loaded_value(value, CONTROL_I1_MAX_MA);
+    if (nvs_get_u16(nvs, "i1", &value) == ESP_OK) s_i1_ma = quantize_current_limit(value, CONTROL_I1_MAX_MA);
     if (nvs_get_u16(nvs, "u2", &value) == ESP_OK) s_u2_mv = clamp_loaded_value(value, CONTROL_U2_MAX_MV);
-    if (nvs_get_u16(nvs, "i2", &value) == ESP_OK) s_i2_ma = clamp_loaded_value(value, CONTROL_I2_MAX_MA);
+    if (nvs_get_u16(nvs, "i2", &value) == ESP_OK) s_i2_ma = quantize_current_limit(value, CONTROL_I2_MAX_MA);
     if (nvs_get_u16(nvs, "oc", &value) == ESP_OK) s_overcurrent_cc = value != 0U;
     if (nvs_get_u16(nvs, "oh", &value) == ESP_OK) {
         s_overheat_c = (uint8_t)clamp_loaded_value_range(value, CONTROL_OVERHEAT_MIN_C, CONTROL_OVERHEAT_MAX_C);

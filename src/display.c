@@ -665,13 +665,8 @@ static void draw_channel_set_line(int y,
                        1U, COLOR_BLACK, COLOR_YELLOW);
         }
     } else if (selected == current_select) {
-        if (digit == CONTROL_DIGIT_WHOLE) {
-            mark_range(fg, bg, current_start, strlen(current), COLOR_BLACK, COLOR_YELLOW);
-        } else {
-            mark_range(fg, bg, current_start, strlen(current), COLOR_YELLOW, COLOR_BLACK);
-            mark_range(fg, bg, current_start + editable_digit_offset(current, digit),
-                       1U, COLOR_BLACK, COLOR_YELLOW);
-        }
+        (void)digit;
+        mark_range(fg, bg, current_start, strlen(current), COLOR_BLACK, COLOR_YELLOW);
     }
 
     draw_rich_text(2, y, line, &roboto_18, fg, bg);

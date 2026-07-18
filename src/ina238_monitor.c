@@ -15,11 +15,13 @@
  *   channel 0: address 0x41, shunt 100 mOhm;
  *   channel 1: address 0x44, shunt 10 mOhm.
  *
- * Channel B INA238 is kept in the wide shunt-voltage ADC range:
+ * Channel A automatically switches shunt-voltage ADC range:
+ *   narrow range: +/-40.96 mV, 1.25 uV/LSB;
  *   wide range: +/-163.84 mV, 5 uV/LSB.
  *
- * Channel B range is not changed at runtime. This avoids interpreting a
- * VSHUNT sample with the wrong LSB immediately after a range change.
+ * Channel B is kept in the wide range. With the 10 mOhm shunt this gives
+ * 500 uA/LSB; changing ranges on both channels would add extra I2C traffic
+ * and one conversion latency for little benefit at the current UI precision.
  *
  */
 
@@ -41,6 +43,7 @@
 #define INA238_NARROW_TO_WIDE_UV     36000
 #define INA238_WIDE_TO_NARROW_UV     30000
 #define INA238_WIDE_LIMIT_UV         163840
+#define INA238_NARROW_LIMIT_UV       40960
 #define INA238_WIDE_SHUNT_LSB_UV     5U
 #define INA238_NARROW_SHUNT_LSB_NV   1250U
 
@@ -48,12 +51,13 @@ typedef struct {
     uint8_t address;
     uint32_t shunt_uohm;
     bool wide_range;
+    bool auto_range;
     i2c_master_dev_handle_t dev;
 } ina238_device_t;
 
 static ina238_device_t s_devices[2] = {
-    {.address = INA238_1_ADDRESS, .shunt_uohm = INA238_1_SHUNT_UOHM, .wide_range = true},
-    {.address = INA238_2_ADDRESS, .shunt_uohm = INA238_2_SHUNT_UOHM, .wide_range = true},
+    {.address = INA238_1_ADDRESS, .shunt_uohm = INA238_1_SHUNT_UOHM, .wide_range = false, .auto_range = true},
+    {.address = INA238_2_ADDRESS, .shunt_uohm = INA238_2_SHUNT_UOHM, .wide_range = true, .auto_range = false},
 };
 static const char *TAG = "ina238";
 
@@ -200,6 +204,22 @@ static int32_t convert_current_ma(int32_t shunt_uv, uint32_t shunt_uohm)
     return (int32_t)(((int64_t)shunt_uv * 1000LL) / (int64_t)shunt_uohm);
 }
 
+static int32_t shunt_limit_uv(bool wide_range)
+{
+    return wide_range ? INA238_WIDE_LIMIT_UV : INA238_NARROW_LIMIT_UV;
+}
+
+static void update_auto_range(ina238_device_t *dev, int32_t abs_shunt_uv)
+{
+    if (!dev->auto_range) return;
+
+    if (!dev->wide_range && abs_shunt_uv >= INA238_NARROW_TO_WIDE_UV) {
+        (void)configure_range(dev, true);
+    } else if (dev->wide_range && abs_shunt_uv <= INA238_WIDE_TO_NARROW_UV) {
+        (void)configure_range(dev, false);
+    }
+}
+
 /* fill_static_channel_info
  * Inputs: channel state and corresponding device config.
  * Returns: none.
@@ -233,7 +253,7 @@ esp_err_t ina238_monitor_init(void)
                                 "ina238", "i2c device");
         }
         (void)configure_adc_averaging(&s_devices[i]);
-        (void)configure_range(&s_devices[i], true);
+        (void)configure_range(&s_devices[i], s_devices[i].wide_range);
         if (s_devices[i].address == INA238_1_ADDRESS) {
             (void)configure_alert_normal_low(&s_devices[i]);
         }
@@ -279,7 +299,8 @@ static void update_device(app_state_t *state, ina238_device_t *dev, app_ina238_c
     out->current_ma = convert_current_ma(shunt_uv, dev->shunt_uohm);
     out->bus_mv = convert_bus_mv(raw_bus);
     out->temperature_mc = convert_temperature_mc(raw_temp);
-    out->saturated = abs_shunt_uv >= INA238_WIDE_LIMIT_UV;
+    out->saturated = abs_shunt_uv >= shunt_limit_uv(dev->wide_range);
+    update_auto_range(dev, abs_shunt_uv);
 }
 
 /* ina238_monitor_update
