@@ -2,6 +2,11 @@
 
 ESP32-WROOM logic probe / dual PSU firmware forked from Logic_v1.
 
+Documentation:
+- [I2C Master Terminal](I2C_MASTER_TERMINAL.md)
+- [Measurement modes](MEASUREMENT_MODES.md)
+- [Analog channel](ANALOG_CHANNEL.md)
+
 Pins:
 - GPIO35: ADC input
 - GPIO27: weak continuous test square wave through 300 kOhm

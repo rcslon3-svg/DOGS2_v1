@@ -3,36 +3,104 @@
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 
+/* Hardware revision selector.
+ *
+ * Default is the current hand-wired PoC.  Build the production engineering
+ * sample with:
+ *   -D LOGIC_V2_BOARD_REV=LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+ */
+#define LOGIC_V2_BOARD_POC                1
+#define LOGIC_V2_BOARD_ENGINEERING_SAMPLE 2
+#ifndef LOGIC_V2_BOARD_REV
+#define LOGIC_V2_BOARD_REV LOGIC_V2_BOARD_POC
+#endif
+
 /* ESP32-WROOM board with external ST7789 1.9" 170x320 SPI TFT. */
 #define PROBE_ADC_CHANNEL       ADC_CHANNEL_0 /* GPIO36 / SENSOR_VP */
 #define PROBE_ADC_GPIO          GPIO_NUM_36
+
+#if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_POC
 #define PROBE_COMPARATOR_GPIO   GPIO_NUM_22
 #define PROBE_BIAS_GPIO         GPIO_NUM_27
 #define PROBE_TEST_SIGNAL_GPIO  GPIO_NUM_26
+#define BOARD_PERIPHERAL_POWER_GPIO GPIO_NUM_NC
+#elif LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+#define PROBE_COMPARATOR_GPIO   GPIO_NUM_NC
+#define PROBE_BIAS_GPIO         GPIO_NUM_NC
+#define PROBE_TEST_SIGNAL_GPIO  GPIO_NUM_NC
+#define BOARD_PERIPHERAL_POWER_GPIO GPIO_NUM_23
+#define BOARD_PERIPHERAL_POWER_ACTIVE_LEVEL 0
+#define BOARD_PERIPHERAL_POWER_AUTO_ENABLE 1
+#else
+#error "Unknown LOGIC_V2_BOARD_REV"
+#endif
 
-/* The old probe functions are disabled while the power-channel hardware is
- * being debugged.
- */
+#ifndef BOARD_PERIPHERAL_POWER_ACTIVE_LEVEL
+#define BOARD_PERIPHERAL_POWER_ACTIVE_LEVEL 1
+#endif
+#ifndef BOARD_PERIPHERAL_POWER_AUTO_ENABLE
+#define BOARD_PERIPHERAL_POWER_AUTO_ENABLE 1
+#endif
+
 #define ANALOG_PROBE_ENABLED    1
+#if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+#define TIMING_INPUT_ENABLED    1
+#else
 #define TIMING_INPUT_ENABLED    0
+#endif
 #define UART_PROBE_ENABLED      1
 #define IO26_DIAG_ENABLED       0
 
-/* Panel controls. Internal pull-ups are enabled in encoder_input.c/control.c. */
+/* Panel controls. Internal pull-ups are enabled in encoder_input.c/control.c
+ * where the selected GPIO supports them.  Engineering-sample buttons are read
+ * through PCA9557, so their direct GPIOs are intentionally not assigned here.
+ */
+#if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_POC
 #define ENCODER_A_GPIO          GPIO_NUM_13
 #define ENCODER_B_GPIO          GPIO_NUM_27
 #define ENCODER_BUTTON_GPIO     GPIO_NUM_14
 #define UI_BUTTON_GPIO          GPIO_NUM_NC
 #define MODE_BUTTON_GPIO        GPIO_NUM_32
 #define GENERATOR_OUTPUT_GPIO   GPIO_NUM_23
+#elif LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+#define ENCODER_A_GPIO          GPIO_NUM_34
+#define ENCODER_B_GPIO          GPIO_NUM_39
+#define ENCODER_BUTTON_GPIO     GPIO_NUM_NC
+#define UI_BUTTON_GPIO          GPIO_NUM_NC
+#define MODE_BUTTON_GPIO        GPIO_NUM_NC
+#define GENERATOR_OUTPUT_GPIO   GPIO_NUM_25
+#endif
+
+#if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+#define FREQUENCY_INPUT_GPIO    GPIO_NUM_13
+#else
+#define FREQUENCY_INPUT_GPIO    PROBE_COMPARATOR_GPIO
+#endif
+
+#if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+#define BUZZER_OUTPUT_GPIO      GPIO_NUM_21
+#define CAN_RX_GPIO             GPIO_NUM_32
+#define CAN_TX_GPIO             GPIO_NUM_33
+#else
+#define BUZZER_OUTPUT_GPIO      GPIO_NUM_NC
+#define CAN_RX_GPIO             GPIO_NUM_NC
+#define CAN_TX_GPIO             GPIO_NUM_NC
+#endif
 
 /* UART experiment. */
+#if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_POC
 #define UART_A_RX_GPIO          GPIO_NUM_19
 #define UART_A_TX_GPIO          GPIO_NUM_18
+#elif LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+#define UART_A_RX_GPIO          GPIO_NUM_13 /* UART/RS485 data from MCU */
+#define UART_A_TX_GPIO          GPIO_NUM_14 /* UART/RS485 data to MCU */
+#endif
 #define UART_TEST_BAUD          115200
-#define UART_PREVIEW_CHARS      15
+#define UART_PREVIEW_CHARS      25
 #define UART_DISPLAY_CHARS      (UART_PREVIEW_CHARS + 3U)
+#define I2C_DISPLAY_CHARS       (UART_DISPLAY_CHARS + 7U)
 
+#if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_POC
 /* Passive I2C sniffer. External jumpers:
  *   IO26/SCL -> IO21
  *   IO25/SDA -> IO22
@@ -44,17 +112,38 @@
 #define I2C_SNIFFER_I2S_CLOCK_OUT_GPIO GPIO_NUM_19
 #define I2C_SNIFFER_I2S_CLOCK_IN_GPIO  GPIO_NUM_19
 #define I2C_SNIFFER_OWNS_UART_PINS     1
+#elif LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+#define I2C_SNIFFER_ENABLED     1
+#define I2C_SNIFFER_SCL_GPIO    GPIO_NUM_26
+#define I2C_SNIFFER_SDA_GPIO    GPIO_NUM_27
+#define I2C_SNIFFER_I2S_CLOCK_OUT_GPIO GPIO_NUM_12
+#define I2C_SNIFFER_I2S_CLOCK_IN_GPIO  GPIO_NUM_12
+#define I2C_SNIFFER_OWNS_UART_PINS     0
+#endif
 
 /* External I2C board. */
 #define INA238_I2C_ENABLED      1
 #define INA238_I2C_PORT         I2C_NUM_0
+#if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_POC
 #define INA238_I2C_SDA_GPIO     GPIO_NUM_25
 #define INA238_I2C_SCL_GPIO     GPIO_NUM_26
+#elif LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+#define INA238_I2C_SDA_GPIO     GPIO_NUM_19
+#define INA238_I2C_SCL_GPIO     GPIO_NUM_18
+#endif
 #define INA238_I2C_HZ           100000U
 #define INA238_1_ADDRESS        0x41U
 #define INA238_2_ADDRESS        0x44U
 #define INA238_1_SHUNT_UOHM     100000U
 #define INA238_2_SHUNT_UOHM     10000U
+
+/* Channel A's voltage-regulator measurement divider is connected after the
+ * current shunt, so INA238 also measures the divider leakage current.  Subtract
+ * 42 uA per output volt (equivalent divider resistance about 23.8 kOhm) to
+ * report only the external load current.  The 420/10000 ratio is expressed in
+ * uA per mV and kept as a fraction to preserve the existing rounded result. */
+#define CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_NUM 420LL
+#define CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_DEN 10000LL
 
 /* TPS55289 buck-boost output controlled by channel 2 setpoints.
  *
@@ -122,6 +211,40 @@
 #define CHANNEL_B_OUTPUT_SHUNT_UOHM    10000U
 #define CHANNEL_B_CURRENT_LIMIT_MAX_MA 5000U
 
+/* Engineering-sample I2C companions on the main bus. */
+#define MAIN_BUS_ADS1110_ADDRESS          0x48U
+#define MAIN_BUS_ADS1110_DIVIDER_NUM      11U
+#define MAIN_BUS_ADS1110_DIVIDER_DEN      1U
+#define BOARD_PCA9557_ADDR_ALL_ZERO       0x18U
+#define BOARD_PCA9557_ADDR_A0_HIGH        0x19U
+
+#if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+#define IO_EXPANDER_CTRL_ADDRESS          BOARD_PCA9557_ADDR_A0_HIGH
+#define IO_EXPANDER_UI_ADDRESS            BOARD_PCA9557_ADDR_ALL_ZERO
+#else
+#define IO_EXPANDER_CTRL_ADDRESS          0U
+#define IO_EXPANDER_UI_ADDRESS            0U
+#endif
+
+#define CTRL_EXP_RELAY2_BIT               0U
+/* SN65HVD231 RS: 0 = high-speed CAN active, 1 = sleep. */
+#define CTRL_EXP_CAN_RS_BIT               1U
+#define CTRL_EXP_UART_RX_FREQ_EN_BIT      2U
+#define CTRL_EXP_UART_TX_ENABLE_BIT       3U
+#define CTRL_EXP_RELAY1_BIT               4U
+#define CTRL_EXP_RS485_TX_ENABLE_BIT      5U
+#define CTRL_EXP_TEST_100HZ_BIT           6U
+#define CTRL_EXP_FAN_ENABLE_BIT           7U
+
+#define UI_EXP_ENCODER_BUTTON_BIT         0U
+#define UI_EXP_CHANNEL_A_BUTTON_BIT       1U
+#define UI_EXP_CHANNEL_B_BUTTON_BIT       2U
+#define UI_EXP_MENU_BUTTON_BIT            3U
+#define UI_EXP_CHANNEL_A_ENABLE_BIT       4U
+#define UI_EXP_CHANNEL_B_ENABLE_BIT       5U
+#define UI_EXP_BUTTON_C_BIT               6U
+#define UI_EXP_UNUSED_BIT                 7U
+
 #define RGB_LED_ENABLED         0
 #define RGB_RED_GPIO            GPIO_NUM_NC
 #define RGB_GREEN_GPIO          GPIO_NUM_NC
@@ -142,13 +265,33 @@
 #define TFT_Y_OFFSET            35
 
 /*
- * Input-voltage monitor on GPIO36:
+ * Input-voltage monitor on GPIO36.
+ *
+ * PoC:
  *
  *   VIN -- 102k -- GPIO36/ADC -- 12k -- GND
  *
  * Vin = Vadc * (102k + 12k) / 12k = Vadc * 9.5.
+ *
+ * Engineering sample:
+ *
+ *   VIN -- 102k -- node -- 1k -- GPIO36/ADC -- 47k -- GND
+ *                  |
+ *                  12k
+ *                  |
+ *                  GND
+ *
+ * The first divider is loaded by the second one:
+ *   Rlow = 12k || (1k + 47k) = 9.6k
+ *   Vnode = VIN * Rlow / (102k + Rlow)
+ *   Vadc  = Vnode * 47k / (1k + 47k)
+ *   VIN   = Vadc * 11.87234.
  */
+#if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_POC
 #define ADC_INPUT_SCALE         9.5f
+#elif LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+#define ADC_INPUT_SCALE         11.87234f
+#endif
 #define PROBE_ADC_ATTEN         ADC_ATTEN_DB_12
 #define LOGIC_LOW_MAX_MV        800U
 #define LOGIC_HIGH_MIN_MV       2600U
@@ -189,5 +332,5 @@
  */
 #define EVENT_SINGLE_EDGE_MAX_HZ 1.0f
 #define UI_PERIOD_MS            50U
-#define TELEMETRY_PERIOD_MS     250U
-#define BLUETOOTH_DEVICE_NAME   "ESP32-Logic-Probe"
+#define TELEMETRY_PERIOD_MS     50U
+#define BLUETOOTH_DEVICE_NAME   "DOGS2_A001"

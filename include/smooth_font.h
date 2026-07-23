@@ -18,5 +18,6 @@ typedef struct {
     uint8_t line_height;
 } smooth_font_t;
 
-extern const smooth_font_t roboto_18;
-extern const smooth_font_t roboto_30;
+extern const smooth_font_t instrument_18;
+extern const smooth_font_t instrument_30;
+extern const smooth_font_t instrument_14;

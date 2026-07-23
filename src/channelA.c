@@ -54,6 +54,7 @@ static i2c_master_dev_handle_t s_tps;
 static i2c_master_dev_handle_t s_mcp4725;
 static const char *TAG = "channelA";
 static bool s_output_programmed;
+static bool s_last_output_enabled;
 static uint16_t s_last_target_mv;
 static uint16_t s_last_target_ma;
 static uint16_t s_last_command_mv;
@@ -191,7 +192,9 @@ static int32_t measured_current_ma(const app_ina238_channel_t *measurement)
     if (!measurement->valid || measurement->shunt_uohm == 0U) return 0;
     int64_t current_ua = ((int64_t)measurement->shunt_uv * 1000000LL) /
                          (int64_t)measurement->shunt_uohm;
-    current_ua -= ((int64_t)measurement->bus_mv * 420LL + 5000LL) / 10000LL;
+    current_ua -= ((int64_t)measurement->bus_mv * CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_NUM +
+                   CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_DEN / 2LL) /
+                  CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_DEN;
     return (int32_t)(current_ua / 1000LL);
 }
 
@@ -396,6 +399,7 @@ esp_err_t channelA_init(void)
                    (uint8_t)(TPS55289_ILIM_ENABLE | current_to_limit_code(0)));
     (void)write_u8(TPS55289_REG_VOUT_SR, TPS55289_VOUT_SR_FAST_OCP);
     s_output_programmed = false;
+    s_last_output_enabled = false;
     s_last_command_mv = 0U;
     s_trim_mv = 0;
     return ESP_OK;
@@ -418,6 +422,7 @@ void channelA_i2c_release(void)
         s_mcp4725 = NULL;
     }
     s_output_programmed = false;
+    s_last_output_enabled = false;
     s_last_command_mv = 0U;
     s_trim_mv = 0;
 }
@@ -431,13 +436,13 @@ void channelA_i2c_release(void)
  * Does: applies changed channel-A setpoints to TPS55289. In stub mode it only
  * publishes the values that would be programmed.
  */
-void channelA_update(app_state_t *state, int64_t now_us)
+void channelA_update(app_state_t *state, int64_t now_us, bool channel_enabled)
 {
     (void)now_us;
 
     uint16_t target_mv = state->control.u2_mv;
     uint16_t target_ma = state->control.i2_ma;
-    bool output_enabled = target_mv != 0U;
+    bool output_enabled = channel_enabled && target_mv != 0U;
     uint16_t command_mv = corrected_target_mv(target_mv,
                                               output_enabled,
                                               state->tps55289.current_limit_active,
@@ -456,10 +461,26 @@ void channelA_update(app_state_t *state, int64_t now_us)
     if (output_enabled) mode |= TPS55289_MODE_OE;
     uint16_t ref_code = voltage_to_ref_code(output_enabled ? programmed_mv : TPS55289_REF_MIN_MV);
 
-    if (!s_output_programmed ||
-        target_mv != s_last_target_mv ||
-        target_ma != s_last_target_ma ||
-        command_mv != s_last_command_mv) {
+    if (s_last_output_enabled && !output_enabled) {
+        esp_err_t err = write_u8(TPS55289_REG_MODE, mode);
+        if (err != ESP_OK) {
+            state->tps55289.last_error = err;
+            state->tps55289.valid = false;
+            state->tps55289.status_valid = false;
+            state->tps55289.limit_valid = false;
+            state->tps55289.current_limit_active = false;
+            return;
+        }
+        s_last_target_mv = target_mv;
+        s_last_target_ma = target_ma;
+        s_last_command_mv = command_mv;
+        s_last_output_enabled = false;
+        s_output_programmed = true;
+    } else if (!s_output_programmed ||
+               target_mv != s_last_target_mv ||
+               target_ma != s_last_target_ma ||
+               command_mv != s_last_command_mv ||
+               output_enabled != s_last_output_enabled) {
         esp_err_t err = write_mcp4725(ldo.dac_code);
         if (err == ESP_OK) err = write_u8(TPS55289_REG_VOUT_FS, TPS55289_VOUT_FS_INTFB_20V);
         if (err == ESP_OK) err = write_u8(TPS55289_REG_IOUT_LIMIT, ilim);
@@ -479,6 +500,7 @@ void channelA_update(app_state_t *state, int64_t now_us)
         s_last_target_mv = target_mv;
         s_last_target_ma = target_ma;
         s_last_command_mv = command_mv;
+        s_last_output_enabled = output_enabled;
         s_output_programmed = true;
     }
 

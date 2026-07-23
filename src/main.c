@@ -1,10 +1,13 @@
 #include <stdio.h>
 #include <string.h>
 #include "bluetooth_spp.h"
+#include "buzzer.h"
 #include "channelA.h"
 #include "channelB.h"
 #include "control.h"
 #include "display.h"
+#include "driver/gpio.h"
+#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -12,6 +15,7 @@
 #include "freertos/task.h"
 #include "i2c_bus.h"
 #include "i2c_i2s_sniffer.h"
+#include "i2c_master_terminal.h"
 #include "i2c_sniffer.h"
 #include "i2c_worker.h"
 #include "ina238_monitor.h"
@@ -89,6 +93,82 @@ static size_t s_command_line_used;
 static int64_t s_command_line_last_us;
 static app_state_t s_state;
 static bool s_i2c_i2s_sniffer_active;
+static app_mode_t s_i2c_gpio_configured_mode = APP_MODE_POWER_SUPPLY;
+
+static int64_t measured_current_ua(char channel, const app_ina238_channel_t *measurement)
+{
+    if (measurement == NULL || !measurement->valid || measurement->shunt_uohm == 0U) return 0;
+    int64_t current_ua = ((int64_t)measurement->shunt_uv * 1000000LL) /
+                         (int64_t)measurement->shunt_uohm;
+    if (channel == 'A') {
+        current_ua -= ((int64_t)measurement->bus_mv * CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_NUM +
+                       CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_DEN / 2LL) /
+                      CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_DEN;
+    }
+    return current_ua;
+}
+
+static void power_telemetry_update(const app_state_t *state, int64_t now_us)
+{
+    static int64_t last_telemetry_us;
+
+    if (state->control.mode != APP_MODE_POWER_SUPPLY || !bluetooth_spp_connected()) {
+        last_telemetry_us = now_us;
+        return;
+    }
+    if (now_us - last_telemetry_us < TELEMETRY_PERIOD_MS * 1000LL) return;
+    last_telemetry_us = now_us;
+
+    const app_ina238_channel_t *a = &state->ina238.channel[0];
+    const app_ina238_channel_t *b = &state->ina238.channel[1];
+    int64_t ia_ua = measured_current_ua('A', a);
+    int64_t ib_ua = measured_current_ua('B', b);
+    char line[48];
+
+    int length = snprintf(line,
+                          sizeof(line),
+                          "E%lld,%lld\r\n",
+                          (long long)ia_ua,
+                          (long long)ib_ua);
+    if (length > 0) bluetooth_spp_write(line, (size_t)length);
+}
+
+static uint64_t gpio_output_mask(gpio_num_t gpio)
+{
+    if (gpio == GPIO_NUM_NC) return 0ULL;
+    return 1ULL << gpio;
+}
+
+static esp_err_t board_power_init(void)
+{
+    uint64_t pin_mask = gpio_output_mask(BOARD_PERIPHERAL_POWER_GPIO);
+    if (pin_mask == 0ULL) return ESP_OK;
+    int inactive_level = BOARD_PERIPHERAL_POWER_ACTIVE_LEVEL ? 0 : 1;
+
+    gpio_set_level(BOARD_PERIPHERAL_POWER_GPIO, inactive_level);
+    gpio_config_t output = {
+        .pin_bit_mask = pin_mask,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&output), TAG, "peripheral power gpio");
+    gpio_set_level(BOARD_PERIPHERAL_POWER_GPIO, inactive_level);
+    ESP_LOGI(TAG, "peripheral power gpio %d inactive level %d",
+             (int)BOARD_PERIPHERAL_POWER_GPIO,
+             inactive_level);
+#if BOARD_PERIPHERAL_POWER_AUTO_ENABLE
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "peripheral power gpio %d active level %d",
+             (int)BOARD_PERIPHERAL_POWER_GPIO,
+             BOARD_PERIPHERAL_POWER_ACTIVE_LEVEL);
+    gpio_set_level(BOARD_PERIPHERAL_POWER_GPIO, BOARD_PERIPHERAL_POWER_ACTIVE_LEVEL);
+#else
+    ESP_LOGW(TAG, "peripheral power auto enable disabled");
+#endif
+    return ESP_OK;
+}
 
 /* enqueue_command
  * Inputs:
@@ -104,8 +184,12 @@ static void enqueue_command(char command)
 
 static void bluetooth_command(char command)
 {
+    if (i2c_master_terminal_input_char(command)) return;
+
 #if UART_PROBE_ENABLED
-    if (s_state.control.mode == APP_MODE_UART || s_state.control.mode == APP_MODE_RS485) {
+    if (s_state.control.mode == APP_MODE_UART ||
+        s_state.control.mode == APP_MODE_LIN ||
+        s_state.control.mode == APP_MODE_RS485) {
         uart_probe_write_bytes(&command, 1U);
         return;
     }
@@ -267,6 +351,7 @@ void app_main(void)
     } else {
         ESP_ERROR_CHECK(nvs);
     }
+    ESP_ERROR_CHECK(board_power_init());
 
     s_commands = xQueueCreate(64, sizeof(char));
     xTaskCreate(uart_command_task, "uart_cmd", 3072, NULL, 4, NULL);
@@ -307,6 +392,11 @@ void app_main(void)
         ESP_ERROR_CHECK(i2c_sniffer_init());
     }
 #endif
+    ESP_LOGI(TAG, "i2c_master_terminal_init");
+    ESP_ERROR_CHECK(i2c_master_terminal_init());
+    ESP_LOGI(TAG, "buzzer_init begin");
+    ESP_ERROR_CHECK(buzzer_init());
+    ESP_LOGI(TAG, "buzzer_init end");
     ESP_LOGI(TAG, "control_init begin");
     ESP_ERROR_CHECK(control_init());
     ESP_LOGI(TAG, "control_init end");
@@ -341,19 +431,54 @@ void app_main(void)
 #endif
         control_update(&s_state);
 #if UART_PROBE_ENABLED && !I2C_SNIFFER_OWNS_UART_PINS
-        uart_probe_configure(s_state.control.mode, s_state.control.uart_baud, s_state.control.rs485_baud);
+        uart_probe_configure(s_state.control.mode,
+                             s_state.control.uart_baud,
+                             s_state.control.lin_baud,
+                             s_state.control.rs485_baud,
+                             s_state.control.lin_mask_value,
+                             s_state.control.lin_mask_care);
         uart_probe_update(&s_state);
 #endif
 #if I2C_SNIFFER_ENABLED
-        if (s_i2c_i2s_sniffer_active) {
-            i2c_i2s_sniffer_configure(s_state.control.mode);
-            i2c_i2s_sniffer_update(&s_state);
-        } else {
-            i2c_sniffer_configure(s_state.control.mode);
-            i2c_sniffer_update(&s_state);
+        /*
+         * Mode changes have two phases for modules sharing the external I2C
+         * pins: first every previous owner is told to leave, then modules are
+         * configured for the new mode.  No module needs to know which module
+         * will own the pins next.
+         */
+        if (s_state.control.mode != s_i2c_gpio_configured_mode) {
+            i2c_master_terminal_configure(APP_MODE_POWER_SUPPLY);
+            if (s_i2c_i2s_sniffer_active) {
+                i2c_i2s_sniffer_configure(APP_MODE_POWER_SUPPLY,
+                                          s_state.control.i2c_mask_value,
+                                          s_state.control.i2c_mask_care);
+            } else {
+                i2c_sniffer_configure(APP_MODE_POWER_SUPPLY,
+                                      s_state.control.i2c_mask_value,
+                                      s_state.control.i2c_mask_care);
+            }
+            s_i2c_gpio_configured_mode = s_state.control.mode;
         }
+
+        i2c_master_terminal_configure(s_state.control.mode);
+        if (s_i2c_i2s_sniffer_active) {
+            i2c_i2s_sniffer_configure(s_state.control.mode,
+                                      s_state.control.i2c_mask_value,
+                                      s_state.control.i2c_mask_care);
+        } else {
+            i2c_sniffer_configure(s_state.control.mode,
+                                  s_state.control.i2c_mask_value,
+                                  s_state.control.i2c_mask_care);
+        }
+        if (s_i2c_i2s_sniffer_active) i2c_i2s_sniffer_update(&s_state);
+        else i2c_sniffer_update(&s_state);
+#else
+        i2c_master_terminal_configure(s_state.control.mode);
 #endif
+        i2c_master_terminal_update(&s_state);
         control_persistence_update(now);
+        buzzer_update();
+        power_telemetry_update(&s_state, now);
 
         if (now - last_ui_us >= UI_PERIOD_MS * 1000LL) {
             last_ui_us = now;

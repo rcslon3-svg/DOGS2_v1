@@ -2,6 +2,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "board_io.h"
+#include "buzzer.h"
 #include "driver/gpio.h"
 #include "encoder_input.h"
 #include "esp_check.h"
@@ -57,12 +59,18 @@ static bool s_overcurrent_cc = true;
 static uint8_t s_overheat_c = 50U;
 static uint16_t s_overpower_w = 100U;
 static uint8_t s_volume_percent = 50U;
+static bool s_channel_a_enabled;
+static bool s_channel_b_enabled;
 static app_mode_t s_mode = APP_MODE_POWER_SUPPLY;
 static bool s_menu_open;
 static uint8_t s_menu_index = APP_MODE_POWER_SUPPLY;
 static size_t s_uart_baud_index = 6U;
+static size_t s_lin_baud_index = 3U;
 static size_t s_rs485_baud_index = 6U;
 static size_t s_can_bitrate_index = 2U;
+static int8_t s_lin_mask[2] = {-1, -1};
+static int8_t s_can_mask[3] = {-1, -1, -1};
+static int8_t s_i2c_mask[2] = {-1, -1};
 static uint8_t s_selected_value = CONTROL_SELECT_NONE;
 static uint8_t s_selected_digit = CONTROL_DIGIT_WHOLE;
 static int32_t s_last_encoder_steps;
@@ -85,6 +93,16 @@ static bool s_mode_button_stable;
 static bool s_mode_button_pressed_previous;
 static int64_t s_mode_button_last_change_us;
 
+static bool s_channel_a_button_raw;
+static bool s_channel_a_button_stable;
+static bool s_channel_a_button_pressed_previous;
+static int64_t s_channel_a_button_last_change_us;
+
+static bool s_channel_b_button_raw;
+static bool s_channel_b_button_stable;
+static bool s_channel_b_button_pressed_previous;
+static int64_t s_channel_b_button_last_change_us;
+
 static const uint32_t s_serial_baud_rates[] = {
     2400U, 4800U, 9600U, 19200U, 38400U, 57600U, 115200U
 };
@@ -92,6 +110,47 @@ static const uint32_t s_serial_baud_rates[] = {
 static const uint32_t s_can_bitrates[] = {
     100000U, 125000U, 250000U, 500000U, 1000000U
 };
+
+static char hex_mask_digit(int8_t value)
+{
+    if (value < 0) return '-';
+    return value < 10 ? (char)('0' + value) : (char)('A' + value - 10);
+}
+
+static void format_hex_mask(const int8_t *digits, uint8_t count, char *out)
+{
+    for (uint8_t i = 0U; i < count; ++i) out[i] = hex_mask_digit(digits[i]);
+    out[count] = '\0';
+}
+
+static uint16_t hex_mask_value(const int8_t *digits, uint8_t count)
+{
+    uint16_t value = 0U;
+    for (uint8_t i = 0U; i < count; ++i) {
+        value <<= 4U;
+        if (digits[i] >= 0) value |= (uint16_t)digits[i];
+    }
+    return value;
+}
+
+static uint8_t hex_mask_care(const int8_t *digits, uint8_t count)
+{
+    uint8_t care = 0U;
+    for (uint8_t i = 0U; i < count; ++i) {
+        if (digits[i] >= 0) care |= (uint8_t)(1U << i);
+    }
+    return care;
+}
+
+static void change_mask_digit(int8_t *digits, uint8_t count, int direction)
+{
+    if (s_selected_digit >= count) return;
+    int value = digits[s_selected_digit];
+    value += direction;
+    if (value > 15) value = -1;
+    if (value < -1) value = 15;
+    digits[s_selected_digit] = (int8_t)value;
+}
 
 /* read_level
  * Inputs: gpio is the input pin number.
@@ -108,6 +167,44 @@ static uint64_t optional_gpio_mask(gpio_num_t gpio)
 {
     if (gpio == GPIO_NUM_NC) return 0ULL;
     return 1ULL << gpio;
+}
+
+static void read_button_levels(bool *ui_button,
+                               bool *encoder_button,
+                               bool *mode_button,
+                               bool *channel_a_button,
+                               bool *channel_b_button)
+{
+    *ui_button = read_level(UI_BUTTON_GPIO);
+    *encoder_button = read_level(ENCODER_BUTTON_GPIO);
+    *mode_button = read_level(MODE_BUTTON_GPIO);
+    *channel_a_button = true;
+    *channel_b_button = true;
+
+#if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+    bool expander_encoder = true;
+    bool expander_menu = true;
+    bool expander_channel_a = true;
+    bool expander_channel_b = true;
+    if (board_io_read_ui_buttons(&expander_encoder,
+                                 &expander_menu,
+                                 &expander_channel_a,
+                                 &expander_channel_b) == ESP_OK) {
+        *encoder_button = expander_encoder;
+        *mode_button = expander_menu;
+        *channel_a_button = expander_channel_a;
+        *channel_b_button = expander_channel_b;
+    }
+#endif
+}
+
+static bool protocol_mode(app_mode_t mode)
+{
+    return mode == APP_MODE_UART ||
+           mode == APP_MODE_LIN ||
+           mode == APP_MODE_RS485 ||
+           mode == APP_MODE_CAN ||
+           mode == APP_MODE_I2C;
 }
 
 /* debounce_pressed
@@ -157,6 +254,8 @@ static uint8_t selected_digit_count(uint8_t selected)
     if (selected == CONTROL_SELECT_OVERCURRENT) return 1U;
     if (selected == CONTROL_SELECT_OVERHEAT) return 2U;
     if (selected == CONTROL_SELECT_OVERPOWER || selected == CONTROL_SELECT_VOLUME) return 3U;
+    if (selected == CONTROL_SELECT_LIN_MASK || selected == CONTROL_SELECT_I2C_MASK) return 2U;
+    if (selected == CONTROL_SELECT_CAN_MASK) return 3U;
     return 0U;
 }
 
@@ -280,6 +379,8 @@ static void load_setpoints(void)
     if (nvs_get_u16(nvs, "vol", &value) == ESP_OK) {
         s_volume_percent = (uint8_t)clamp_loaded_value(value, CONTROL_VOLUME_MAX_PERCENT);
     }
+    if (nvs_get_u16(nvs, "ena", &value) == ESP_OK) s_channel_a_enabled = value != 0U;
+    if (nvs_get_u16(nvs, "enb", &value) == ESP_OK) s_channel_b_enabled = value != 0U;
 
     nvs_close(nvs);
 }
@@ -299,6 +400,8 @@ static esp_err_t save_setpoints(void)
         (err = nvs_set_u16(nvs, "oh", s_overheat_c)) != ESP_OK ||
         (err = nvs_set_u16(nvs, "op", s_overpower_w)) != ESP_OK ||
         (err = nvs_set_u16(nvs, "vol", s_volume_percent)) != ESP_OK ||
+        (err = nvs_set_u16(nvs, "ena", s_channel_a_enabled ? 1U : 0U)) != ESP_OK ||
+        (err = nvs_set_u16(nvs, "enb", s_channel_b_enabled ? 1U : 0U)) != ESP_OK ||
         (err = nvs_commit(nvs)) != ESP_OK) {
         nvs_close(nvs);
         return err;
@@ -359,14 +462,23 @@ static void select_whole_value(uint8_t selected)
     s_selected_digit = CONTROL_DIGIT_WHOLE;
 }
 
+static bool mask_selection(uint8_t selected)
+{
+    return selected == CONTROL_SELECT_LIN_MASK ||
+           selected == CONTROL_SELECT_CAN_MASK ||
+           selected == CONTROL_SELECT_I2C_MASK;
+}
+
 static uint8_t first_selection_for_mode(app_mode_t mode)
 {
     switch (mode) {
         case APP_MODE_POWER_SUPPLY: return CONTROL_SELECT_U2;
         case APP_MODE_GENERATOR:    return CONTROL_SELECT_GEN_FREQ;
         case APP_MODE_UART:         return CONTROL_SELECT_UART_BAUD;
+        case APP_MODE_LIN:          return CONTROL_SELECT_LIN_BAUD;
         case APP_MODE_RS485:        return CONTROL_SELECT_RS485_BAUD;
         case APP_MODE_CAN:          return CONTROL_SELECT_CAN_BITRATE;
+        case APP_MODE_I2C:          return CONTROL_SELECT_I2C_MASK;
         case APP_MODE_SETTING:      return CONTROL_SELECT_OVERCURRENT;
         default:                    return CONTROL_SELECT_NONE;
     }
@@ -517,9 +629,31 @@ static void move_index(size_t *index, size_t count, int direction)
 
 static void change_protocol_value(int direction)
 {
+    if (s_selected_digit != CONTROL_DIGIT_WHOLE) {
+        switch (s_selected_value) {
+            case CONTROL_SELECT_LIN_MASK:
+                change_mask_digit(s_lin_mask, 2U, direction);
+                break;
+            case CONTROL_SELECT_CAN_MASK:
+                change_mask_digit(s_can_mask, 3U, direction);
+                break;
+            case CONTROL_SELECT_I2C_MASK:
+                change_mask_digit(s_i2c_mask, 2U, direction);
+                break;
+            default:
+                break;
+        }
+        return;
+    }
+
     switch (s_selected_value) {
         case CONTROL_SELECT_UART_BAUD:
             move_index(&s_uart_baud_index,
+                       sizeof(s_serial_baud_rates) / sizeof(s_serial_baud_rates[0]),
+                       direction);
+            break;
+        case CONTROL_SELECT_LIN_BAUD:
+            move_index(&s_lin_baud_index,
                        sizeof(s_serial_baud_rates) / sizeof(s_serial_baud_rates[0]),
                        direction);
             break;
@@ -535,6 +669,54 @@ static void change_protocol_value(int direction)
             break;
         default:
             break;
+    }
+}
+
+static void move_protocol_selection(int direction)
+{
+    if (s_mode == APP_MODE_UART || s_mode == APP_MODE_RS485) {
+        if (s_selected_value == CONTROL_SELECT_NONE) select_whole_value(first_selection_for_mode(s_mode));
+        else select_whole_value(CONTROL_SELECT_NONE);
+        return;
+    }
+
+    if (s_mode == APP_MODE_LIN) {
+        if (direction >= 0) {
+            switch (s_selected_value) {
+                case CONTROL_SELECT_LIN_BAUD: select_whole_value(CONTROL_SELECT_LIN_MASK); break;
+                case CONTROL_SELECT_LIN_MASK: select_whole_value(CONTROL_SELECT_NONE); break;
+                default:                      select_whole_value(CONTROL_SELECT_LIN_BAUD); break;
+            }
+        } else {
+            switch (s_selected_value) {
+                case CONTROL_SELECT_LIN_BAUD: select_whole_value(CONTROL_SELECT_NONE); break;
+                case CONTROL_SELECT_LIN_MASK: select_whole_value(CONTROL_SELECT_LIN_BAUD); break;
+                default:                      select_whole_value(CONTROL_SELECT_LIN_MASK); break;
+            }
+        }
+        return;
+    }
+
+    if (s_mode == APP_MODE_CAN) {
+        if (direction >= 0) {
+            switch (s_selected_value) {
+                case CONTROL_SELECT_CAN_BITRATE: select_whole_value(CONTROL_SELECT_CAN_MASK); break;
+                case CONTROL_SELECT_CAN_MASK:    select_whole_value(CONTROL_SELECT_NONE); break;
+                default:                         select_whole_value(CONTROL_SELECT_CAN_BITRATE); break;
+            }
+        } else {
+            switch (s_selected_value) {
+                case CONTROL_SELECT_CAN_BITRATE: select_whole_value(CONTROL_SELECT_NONE); break;
+                case CONTROL_SELECT_CAN_MASK:    select_whole_value(CONTROL_SELECT_CAN_BITRATE); break;
+                default:                         select_whole_value(CONTROL_SELECT_CAN_MASK); break;
+            }
+        }
+        return;
+    }
+
+    if (s_mode == APP_MODE_I2C) {
+        if (s_selected_value == CONTROL_SELECT_NONE) select_whole_value(CONTROL_SELECT_I2C_MASK);
+        else select_whole_value(CONTROL_SELECT_NONE);
     }
 }
 
@@ -592,9 +774,8 @@ static void move_whole_selection(int direction)
         }
     } else if (s_mode == APP_MODE_SETTING) {
         move_setting_selection(direction);
-    } else if (s_mode == APP_MODE_UART || s_mode == APP_MODE_RS485 || s_mode == APP_MODE_CAN) {
-        if (s_selected_value == CONTROL_SELECT_NONE) select_whole_value(first_selection_for_mode(s_mode));
-        else select_whole_value(CONTROL_SELECT_NONE);
+    } else if (protocol_mode(s_mode)) {
+        move_protocol_selection(direction);
     } else if (direction >= 0) {
         switch (s_selected_value) {
             case CONTROL_SELECT_U2:   select_whole_value(CONTROL_SELECT_U1); break;
@@ -633,46 +814,73 @@ static void button_advance_selection(void)
         if (s_selected_value == CONTROL_SELECT_GEN_ON) {
             generator_output_state_t generator = generator_output_get_state();
             generator_output_set_enabled(!generator.enabled);
+        } else if (protocol_mode(s_mode)) {
+            move_protocol_selection(1);
         }
         return;
     }
 
     if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
-        s_selected_digit = (uint8_t)(count - 1U);
-    } else if (s_selected_digit == 0U) {
-        s_selected_digit = CONTROL_DIGIT_WHOLE;
+        s_selected_digit = mask_selection(s_selected_value) ? 0U : (uint8_t)(count - 1U);
+    } else if ((!mask_selection(s_selected_value) && s_selected_digit == 0U) ||
+               (mask_selection(s_selected_value) && s_selected_digit >= count - 1U)) {
+        if (s_mode == APP_MODE_CAN && s_selected_value == CONTROL_SELECT_CAN_MASK) {
+            select_whole_value(CONTROL_SELECT_CAN_BITRATE);
+        } else {
+            s_selected_digit = CONTROL_DIGIT_WHOLE;
+        }
     } else {
-        --s_selected_digit;
+        if (mask_selection(s_selected_value)) ++s_selected_digit;
+        else --s_selected_digit;
     }
 }
 
 esp_err_t control_init(void)
 {
+    uint64_t button_mask = optional_gpio_mask(UI_BUTTON_GPIO) |
+                           optional_gpio_mask(ENCODER_BUTTON_GPIO) |
+                           optional_gpio_mask(MODE_BUTTON_GPIO);
     gpio_config_t input = {
-        .pin_bit_mask = optional_gpio_mask(UI_BUTTON_GPIO) |
-                        optional_gpio_mask(ENCODER_BUTTON_GPIO) |
-                        optional_gpio_mask(MODE_BUTTON_GPIO),
+        .pin_bit_mask = button_mask,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
 
-    ESP_RETURN_ON_ERROR(gpio_config(&input), "control", "gpio config");
+    if (button_mask != 0ULL) {
+        ESP_RETURN_ON_ERROR(gpio_config(&input), "control", "gpio config");
+    }
     ESP_RETURN_ON_ERROR(encoder_input_init(), "control", "encoder init");
     ESP_RETURN_ON_ERROR(generator_output_init(), "control", "generator init");
     load_setpoints();
 
-    s_ui_raw = read_level(UI_BUTTON_GPIO);
+    bool ui_button = true;
+    bool encoder_button = true;
+    bool mode_button = true;
+    bool channel_a_button = true;
+    bool channel_b_button = true;
+    read_button_levels(&ui_button,
+                       &encoder_button,
+                       &mode_button,
+                       &channel_a_button,
+                       &channel_b_button);
+    s_ui_raw = ui_button;
     s_ui_stable = s_ui_raw;
-    s_encoder_button_raw = read_level(ENCODER_BUTTON_GPIO);
+    s_encoder_button_raw = encoder_button;
     s_encoder_button_stable = s_encoder_button_raw;
-    s_mode_button_raw = read_level(MODE_BUTTON_GPIO);
+    s_mode_button_raw = mode_button;
     s_mode_button_stable = s_mode_button_raw;
+    s_channel_a_button_raw = channel_a_button;
+    s_channel_a_button_stable = s_channel_a_button_raw;
+    s_channel_b_button_raw = channel_b_button;
+    s_channel_b_button_stable = s_channel_b_button_raw;
     s_last_control_activity_us = esp_timer_get_time();
     s_ui_last_change_us = s_last_control_activity_us;
     s_encoder_button_last_change_us = s_last_control_activity_us;
     s_mode_button_last_change_us = s_last_control_activity_us;
+    s_channel_a_button_last_change_us = s_last_control_activity_us;
+    s_channel_b_button_last_change_us = s_last_control_activity_us;
 
     return ESP_OK;
 }
@@ -691,14 +899,38 @@ void control_persistence_update(int64_t now_us)
     }
 }
 
+void control_force_channel_enabled(char channel, bool enabled)
+{
+    bool changed = false;
+    if (channel == 'A' && s_channel_a_enabled != enabled) {
+        s_channel_a_enabled = enabled;
+        changed = true;
+    } else if (channel == 'B' && s_channel_b_enabled != enabled) {
+        s_channel_b_enabled = enabled;
+        changed = true;
+    }
+
+    if (!changed) return;
+    buzzer_beep_1khz_50ms();
+    s_settings_dirty = true;
+    s_settings_last_change_us = 0;
+}
+
 void control_update(app_state_t *state)
 {
     int64_t now_us = esp_timer_get_time();
     bool encoder_a = encoder_input_get_a();
     bool encoder_b = encoder_input_get_b();
-    bool ui_button = read_level(UI_BUTTON_GPIO);
-    bool encoder_button = read_level(ENCODER_BUTTON_GPIO);
-    bool mode_button = read_level(MODE_BUTTON_GPIO);
+    bool ui_button = true;
+    bool encoder_button = true;
+    bool mode_button = true;
+    bool channel_a_button = true;
+    bool channel_b_button = true;
+    read_button_levels(&ui_button,
+                       &encoder_button,
+                       &mode_button,
+                       &channel_a_button,
+                       &channel_b_button);
 
     bool ui_pressed = debounce_pressed(ui_button,
                                        now_us,
@@ -718,9 +950,34 @@ void control_update(app_state_t *state)
                                                 &s_mode_button_stable,
                                                 &s_mode_button_last_change_us,
                                                 &s_mode_button_pressed_previous);
+    bool channel_a_button_pressed = debounce_pressed(channel_a_button,
+                                                     now_us,
+                                                     &s_channel_a_button_raw,
+                                                     &s_channel_a_button_stable,
+                                                     &s_channel_a_button_last_change_us,
+                                                     &s_channel_a_button_pressed_previous);
+    bool channel_b_button_pressed = debounce_pressed(channel_b_button,
+                                                     now_us,
+                                                     &s_channel_b_button_raw,
+                                                     &s_channel_b_button_stable,
+                                                     &s_channel_b_button_last_change_us,
+                                                     &s_channel_b_button_pressed_previous);
     if (mode_button_pressed) {
         if (s_menu_open) close_mode_menu();
         else open_mode_menu();
+        mark_control_activity(now_us);
+    }
+
+    if (channel_a_button_pressed) {
+        s_channel_a_enabled = !s_channel_a_enabled;
+        buzzer_beep_1khz_50ms();
+        mark_setpoints_changed();
+        mark_control_activity(now_us);
+    }
+    if (channel_b_button_pressed) {
+        s_channel_b_enabled = !s_channel_b_enabled;
+        buzzer_beep_1khz_50ms();
+        mark_setpoints_changed();
         mark_control_activity(now_us);
     }
 
@@ -740,12 +997,14 @@ void control_update(app_state_t *state)
     while (encoder_steps > 0) {
         if (s_menu_open) {
             move_mode_menu(1);
-        } else if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
-            if (s_mode == APP_MODE_UART || s_mode == APP_MODE_RS485 || s_mode == APP_MODE_CAN) {
+        } else if (protocol_mode(s_mode)) {
+            if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
                 change_protocol_value(1);
             } else {
-                move_whole_selection(1);
+                change_protocol_value(1);
             }
+        } else if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
+            move_whole_selection(1);
         } else if (s_mode == APP_MODE_GENERATOR) {
             change_generator_value(1);
         } else if (s_mode == APP_MODE_SETTING) {
@@ -758,12 +1017,14 @@ void control_update(app_state_t *state)
     while (encoder_steps < 0) {
         if (s_menu_open) {
             move_mode_menu(-1);
-        } else if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
-            if (s_mode == APP_MODE_UART || s_mode == APP_MODE_RS485 || s_mode == APP_MODE_CAN) {
+        } else if (protocol_mode(s_mode)) {
+            if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
                 change_protocol_value(-1);
             } else {
-                move_whole_selection(-1);
+                change_protocol_value(-1);
             }
+        } else if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
+            move_whole_selection(-1);
         } else if (s_mode == APP_MODE_GENERATOR) {
             change_generator_value(-1);
         } else if (s_mode == APP_MODE_SETTING) {
@@ -802,12 +1063,24 @@ void control_update(app_state_t *state)
     state->control.generator_duty_percent = generator.duty_percent;
     state->control.generator_on = generator.enabled;
     state->control.uart_baud = s_serial_baud_rates[s_uart_baud_index];
+    state->control.lin_baud = s_serial_baud_rates[s_lin_baud_index];
     state->control.rs485_baud = s_serial_baud_rates[s_rs485_baud_index];
     state->control.can_bitrate = s_can_bitrates[s_can_bitrate_index];
+    format_hex_mask(s_lin_mask, 2U, state->control.lin_mask);
+    format_hex_mask(s_can_mask, 3U, state->control.can_mask);
+    format_hex_mask(s_i2c_mask, 2U, state->control.i2c_mask);
+    state->control.lin_mask_value = hex_mask_value(s_lin_mask, 2U);
+    state->control.lin_mask_care = hex_mask_care(s_lin_mask, 2U);
+    state->control.can_mask_value = hex_mask_value(s_can_mask, 3U);
+    state->control.can_mask_care = hex_mask_care(s_can_mask, 3U);
+    state->control.i2c_mask_value = hex_mask_value(s_i2c_mask, 2U);
+    state->control.i2c_mask_care = hex_mask_care(s_i2c_mask, 2U);
     state->control.overcurrent_cc = s_overcurrent_cc;
     state->control.overheat_c = s_overheat_c;
     state->control.overpower_w = s_overpower_w;
     state->control.volume_percent = s_volume_percent;
+    state->control.channel_a_enabled = s_channel_a_enabled;
+    state->control.channel_b_enabled = s_channel_b_enabled;
     state->control.selected_value = s_selected_value;
     state->control.selected_digit = s_selected_digit;
     state->control.last_encoder_steps = s_last_encoder_steps;

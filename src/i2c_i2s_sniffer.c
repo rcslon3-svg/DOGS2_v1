@@ -26,19 +26,20 @@
 
 #define I2C_I2S_SAMPLE_HZ 2000000U
 #define I2C_I2S_DMA_DESC_BYTES 4000U
-#define I2C_I2S_DMA_DESC_COUNT 8U
+#define I2C_I2S_DMA_DESC_COUNT 16U
 #define I2C_I2S_BUFFER_BYTES (I2C_I2S_DMA_DESC_BYTES * I2C_I2S_DMA_DESC_COUNT)
 #define I2C_I2S_TX_CLOCK_BUFFER_BYTES 256U
 #define I2C_I2S_LINE_LEN 256U
 #define I2C_I2S_ENABLE_EXPERIMENT 1
 #define I2C_I2S_CLOCK_OUT_GPIO I2C_SNIFFER_I2S_CLOCK_OUT_GPIO
 #define I2C_I2S_CLOCK_IN_GPIO I2C_SNIFFER_I2S_CLOCK_IN_GPIO
-#define I2C_I2S_DEBUG_ALWAYS 1
+#define I2C_I2S_DEBUG_ALWAYS 0
 #define I2C_I2S_DEBUG_LOG 0
 #define I2C_I2S_LAYOUT_DEBUG_CAPTURES 0U
 #define I2C_I2S_RAW_DEBUG_ACTIVE_CAPTURES 0U
 #define I2C_I2S_MIN_STABLE_SAMPLES 3U
 #define I2C_I2S_CLKM_DIV_NUM (80000000U / I2C_I2S_SAMPLE_HZ)
+#define I2C_I2S_PUBLISH_MIN_US 50000LL
 
 typedef struct {
     bool active;
@@ -69,8 +70,8 @@ static intr_handle_t s_i2s0_intr;
 static TaskHandle_t s_task;
 static volatile app_mode_t s_active_mode = APP_MODE_POWER_SUPPLY;
 static portMUX_TYPE s_text_lock = portMUX_INITIALIZER_UNLOCKED;
-static char s_text[UART_DISPLAY_CHARS + 1U] = "";
-static char s_lines[3][UART_DISPLAY_CHARS + 1U] = {{0}};
+static char s_text[I2C_DISPLAY_CHARS + 1U] = "";
+static char s_lines[4][I2C_DISPLAY_CHARS + 1U] = {{0}};
 static uint32_t s_packets;
 static uint32_t s_errors;
 static uint32_t s_captures;
@@ -80,6 +81,10 @@ static uint32_t s_bad_lines;
 static uint32_t s_unknown_addr_lines;
 static volatile uint32_t s_overruns;
 static volatile bool s_overrun_pending;
+static bool s_rx_running;
+static uint16_t s_mask_value;
+static uint8_t s_mask_care;
+static int64_t s_last_publish_us;
 static i2c_decode_context_t s_decoder;
 static i2c_sample_filter_t s_sample_filter;
 #if I2C_I2S_LAYOUT_DEBUG_CAPTURES > 0U
@@ -95,13 +100,14 @@ static void store_preview(const char *line)
     if (strlen(line) >= 5U && memcmp(line, "[I2C]", 5U) == 0) preview = line + 5U;
 
     size_t length = strlen(preview);
-    if (length > UART_DISPLAY_CHARS) length = UART_DISPLAY_CHARS;
+    if (length > I2C_DISPLAY_CHARS) length = I2C_DISPLAY_CHARS;
 
     portENTER_CRITICAL(&s_text_lock);
     memcpy(s_lines[0], s_lines[1], sizeof(s_lines[0]));
     memcpy(s_lines[1], s_lines[2], sizeof(s_lines[1]));
-    memcpy(s_lines[2], preview, length);
-    s_lines[2][length] = '\0';
+    memcpy(s_lines[2], s_lines[3], sizeof(s_lines[2]));
+    memcpy(s_lines[3], preview, length);
+    s_lines[3][length] = '\0';
     memcpy(s_text, preview, length + 1U);
     ++s_packets;
     portEXIT_CRITICAL(&s_text_lock);
@@ -168,13 +174,58 @@ static bool parse_ack_token(const char **cursor)
     return **cursor == '\0' || **cursor == ' ';
 }
 
+static bool address_matches_mask(uint16_t address, uint8_t digits, uint16_t mask_value, uint8_t mask_care)
+{
+    if (mask_care == 0U) return true;
+    for (uint8_t i = 0U; i < digits; ++i) {
+        if ((mask_care & (uint8_t)(1U << i)) == 0U) continue;
+        uint8_t shift = (uint8_t)((digits - 1U - i) * 4U);
+        if (((address >> shift) & 0x0FU) != ((mask_value >> shift) & 0x0FU)) return false;
+    }
+    return true;
+}
+
+static bool line_matches_i2c_mask(const char *line)
+{
+    const char *cursor = line;
+    if (memcmp(cursor, "[I2C]", 5U) == 0) cursor += 5;
+    if (s_mask_care == 0U) return true;
+
+    while (*cursor != '\0') {
+        while (*cursor == ' ') ++cursor;
+        if (*cursor == 'S') {
+            ++cursor;
+            continue;
+        }
+        if (*cursor == 'W' || *cursor == 'R') {
+            ++cursor;
+            uint8_t address = 0U;
+            if (!parse_hex_byte_token(&cursor, &address)) return false;
+            if (address_matches_mask(address, 2U, s_mask_value, s_mask_care)) return true;
+            (void)parse_ack_token(&cursor);
+            continue;
+        }
+        uint8_t data = 0U;
+        if (!parse_hex_byte_token(&cursor, &data) || !parse_ack_token(&cursor)) return false;
+    }
+    return false;
+}
+
+static bool publish_rate_allowed(void)
+{
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_publish_us < I2C_I2S_PUBLISH_MIN_US) return false;
+    s_last_publish_us = now;
+    return true;
+}
+
 static bool known_i2c_address(uint8_t address)
 {
     return address == 0x41U || address == 0x44U || address == 0x75U ||
            address == 0x60U || address == 0x6AU;
 }
 
-static void validate_line(const char *line)
+static bool validate_line(const char *line)
 {
     const char *cursor = line;
     if (memcmp(cursor, "[I2C]", 5U) == 0) cursor += 5;
@@ -226,6 +277,8 @@ static void validate_line(const char *line)
     else if (unknown) ++s_unknown_addr_lines;
     else ++s_valid_lines;
     portEXIT_CRITICAL(&s_text_lock);
+
+    return !malformed && saw_address && saw_stop;
 }
 
 static void publish_line(const char *line)
@@ -234,7 +287,9 @@ static void publish_line(const char *line)
     static uint32_t debug_log_count;
 #endif
     size_t length = strlen(line);
-    validate_line(line);
+    if (!validate_line(line)) return;
+    if (!line_matches_i2c_mask(line)) return;
+    if (s_mask_care == 0U && !publish_rate_allowed()) return;
     store_preview(line);
 #if I2C_I2S_DEBUG_LOG
     if (s_captures > 8000U && debug_log_count < 20U) {
@@ -243,8 +298,11 @@ static void publish_line(const char *line)
     }
 #endif
     if (s_active_mode != APP_MODE_I2C || !bluetooth_spp_connected()) return;
-    bluetooth_spp_write(line, length);
-    bluetooth_spp_write("\r\n", 2U);
+    char bt_line[I2C_I2S_LINE_LEN + 2U];
+    if (length > I2C_I2S_LINE_LEN) length = I2C_I2S_LINE_LEN;
+    memcpy(bt_line, line, length);
+    memcpy(bt_line + length, "\r\n", 2U);
+    bluetooth_spp_write(bt_line, length + 2U);
 }
 
 static void decoder_reset_line(i2c_decode_context_t *ctx)
@@ -472,12 +530,6 @@ static void i2s_dma_reset(void)
     while (I2S0.state.rx_fifo_reset_back) {}
 }
 
-static bool dma_buffer_is_valid(const uint8_t *buffer)
-{
-    return buffer >= s_dma_buffer && buffer < s_dma_buffer + I2C_I2S_BUFFER_BYTES &&
-           (((uintptr_t)(buffer - s_dma_buffer) % I2C_I2S_DMA_DESC_BYTES) == 0U);
-}
-
 static void i2s_rx_ring_prepare(void)
 {
     for (size_t i = 0U; i < I2C_I2S_DMA_DESC_COUNT; ++i) {
@@ -496,6 +548,7 @@ static void i2s_rx_ring_prepare(void)
 
 static void i2s_rx_ring_start(void)
 {
+    if (s_rx_running) return;
     I2S0.conf.rx_start = 0;
     I2S0.in_link.stop = 1;
     I2S0.in_link.start = 0;
@@ -514,6 +567,13 @@ static void i2s_rx_ring_start(void)
     I2S0.int_ena.in_suc_eof = 1;
     I2S0.in_link.start = 1;
     I2S0.conf.rx_start = 1;
+    s_rx_running = true;
+}
+
+static bool dma_buffer_is_valid(const uint8_t *buffer)
+{
+    return buffer >= s_dma_buffer && buffer < s_dma_buffer + I2C_I2S_BUFFER_BYTES &&
+           (((uintptr_t)(buffer - s_dma_buffer) % I2C_I2S_DMA_DESC_BYTES) == 0U);
 }
 
 static void IRAM_ATTR i2s0_rx_isr(void *argument)
@@ -527,6 +587,7 @@ static void IRAM_ATTR i2s0_rx_isr(void *argument)
     if (finished == NULL) return;
 
     const uint8_t *buffer = (const uint8_t *)finished->buf;
+
     BaseType_t need_yield = pdFALSE;
     if (xQueueSendFromISR(s_dma_ready_queue, &buffer, &need_yield) != pdTRUE) {
         const uint8_t *dropped = NULL;
@@ -540,17 +601,20 @@ static void IRAM_ATTR i2s0_rx_isr(void *argument)
 
 static void i2s_rx_ring_stop(void)
 {
+    if (!s_rx_running) return;
     I2S0.conf.rx_start = 0;
     I2S0.in_link.stop = 1;
     I2S0.int_ena.in_suc_eof = 0;
     I2S0.int_clr.val = I2S0.int_raw.val;
+    xQueueReset(s_dma_ready_queue);
+    s_overrun_pending = false;
+    s_rx_running = false;
 }
 
 static void i2c_i2s_task(void *argument)
 {
     (void)argument;
     int64_t last_log_us = 0;
-    i2s_rx_ring_start();
     while (true) {
         if (!I2C_I2S_DEBUG_ALWAYS && s_active_mode != APP_MODE_I2C) {
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -575,17 +639,19 @@ static void i2c_i2s_task(void *argument)
         int64_t now = esp_timer_get_time();
         if (now - last_log_us >= 1000000LL) {
             last_log_us = now;
-            ESP_LOGI(TAG,
-                     "stats captures=%lu timeouts=%lu overruns=%lu packets=%lu valid=%lu bad=%lu unknown=%lu errors=%lu mode=%d",
-                     (unsigned long)s_captures,
-                     (unsigned long)s_timeouts,
-                     (unsigned long)s_overruns,
-                     (unsigned long)s_packets,
-                     (unsigned long)s_valid_lines,
-                     (unsigned long)s_bad_lines,
-                     (unsigned long)s_unknown_addr_lines,
-                     (unsigned long)s_errors,
-                     (int)s_active_mode);
+            if (s_active_mode == APP_MODE_I2C) {
+                ESP_LOGI(TAG,
+                         "stats captures=%lu timeouts=%lu overruns=%lu packets=%lu valid=%lu bad=%lu unknown=%lu errors=%lu mode=%d",
+                         (unsigned long)s_captures,
+                         (unsigned long)s_timeouts,
+                         (unsigned long)s_overruns,
+                         (unsigned long)s_packets,
+                         (unsigned long)s_valid_lines,
+                         (unsigned long)s_bad_lines,
+                         (unsigned long)s_unknown_addr_lines,
+                         (unsigned long)s_errors,
+                         (int)s_active_mode);
+            }
         }
     }
     i2s_rx_ring_stop();
@@ -768,10 +834,21 @@ esp_err_t i2c_i2s_sniffer_init(void)
 #endif
 }
 
-void i2c_i2s_sniffer_configure(app_mode_t mode)
+void i2c_i2s_sniffer_configure(app_mode_t mode, uint16_t mask_value, uint8_t mask_care)
 {
+    s_mask_value = mask_value;
+    s_mask_care = mask_care;
     if (mode != s_active_mode) {
-        if (mode == APP_MODE_I2C || s_active_mode == APP_MODE_I2C) clear_preview();
+        bool was_i2c = s_active_mode == APP_MODE_I2C;
+        bool now_i2c = mode == APP_MODE_I2C;
+        if (was_i2c && !now_i2c) {
+            i2s_rx_ring_stop();
+            clear_preview();
+        } else if (!was_i2c && now_i2c) {
+            decoder_reset_stream();
+            clear_preview();
+            i2s_rx_ring_start();
+        }
         s_active_mode = mode;
     }
 }

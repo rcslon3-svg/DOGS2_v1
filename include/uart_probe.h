@@ -20,12 +20,17 @@ esp_err_t uart_probe_init(void);
 void uart_probe_update(app_state_t *state);
 
 /* uart_probe_configure
- * Inputs: active application mode and selected UART/RS485 baud rates.
+ * Inputs: active application mode and selected UART/LIN/RS485 baud rates.
  * Returns: none.
  * Does: applies the real UART baud and enables/disables Bluetooth forwarding
  * according to the active screen.
  */
-void uart_probe_configure(app_mode_t mode, uint32_t uart_baud, uint32_t rs485_baud);
+void uart_probe_configure(app_mode_t mode,
+                          uint32_t uart_baud,
+                          uint32_t lin_baud,
+                          uint32_t rs485_baud,
+                          uint16_t lin_mask_value,
+                          uint8_t lin_mask_care);
 
 /* uart_probe_write_bytes
  * Inputs: data points to bytes to transmit on UART TX.

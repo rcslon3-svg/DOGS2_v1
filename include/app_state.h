@@ -10,10 +10,12 @@ typedef enum {
     APP_MODE_POWER_SUPPLY = 0,
     APP_MODE_GENERATOR,
     APP_MODE_UART,
+    APP_MODE_LIN,
     APP_MODE_1WIRE,
     APP_MODE_RS485,
     APP_MODE_CAN,
     APP_MODE_I2C,
+    APP_MODE_I2C_MASTER,
     APP_MODE_SETTING,
     APP_MODE_COUNT
 } app_mode_t;
@@ -30,10 +32,14 @@ typedef enum {
     CONTROL_SELECT_UART_BAUD = 8,
     CONTROL_SELECT_RS485_BAUD = 9,
     CONTROL_SELECT_CAN_BITRATE = 10,
-    CONTROL_SELECT_OVERCURRENT = 11,
-    CONTROL_SELECT_OVERHEAT = 12,
-    CONTROL_SELECT_OVERPOWER = 13,
-    CONTROL_SELECT_VOLUME = 14,
+    CONTROL_SELECT_LIN_BAUD = 11,
+    CONTROL_SELECT_OVERCURRENT = 12,
+    CONTROL_SELECT_OVERHEAT = 13,
+    CONTROL_SELECT_OVERPOWER = 14,
+    CONTROL_SELECT_VOLUME = 15,
+    CONTROL_SELECT_LIN_MASK = 16,
+    CONTROL_SELECT_CAN_MASK = 17,
+    CONTROL_SELECT_I2C_MASK = 18,
 } control_select_t;
 
 typedef enum {
@@ -76,6 +82,7 @@ typedef struct {
 
 typedef struct {
     uint32_t adc_mv;
+    uint32_t input_mv;
     uint32_t voltage_mv;
     uint32_t vpp_mv;
     uint32_t test_span_mv;
@@ -92,8 +99,8 @@ typedef struct {
 } app_uart_state_t;
 
 typedef struct {
-    char text[UART_DISPLAY_CHARS + 1U];
-    char lines[3][UART_DISPLAY_CHARS + 1U];
+    char text[I2C_DISPLAY_CHARS + 1U];
+    char lines[4][I2C_DISPLAY_CHARS + 1U];
     uint32_t packets;
     uint32_t errors;
 } app_i2c_sniffer_state_t;
@@ -168,12 +175,24 @@ typedef struct {
     uint8_t generator_duty_percent;
     bool generator_on;
     uint32_t uart_baud;
+    uint32_t lin_baud;
     uint32_t rs485_baud;
     uint32_t can_bitrate;
+    char lin_mask[3];
+    char can_mask[4];
+    char i2c_mask[3];
+    uint16_t lin_mask_value;
+    uint8_t lin_mask_care;
+    uint16_t can_mask_value;
+    uint8_t can_mask_care;
+    uint16_t i2c_mask_value;
+    uint8_t i2c_mask_care;
     bool overcurrent_cc;
     uint8_t overheat_c;
     uint16_t overpower_w;
     uint8_t volume_percent;
+    bool channel_a_enabled;
+    bool channel_b_enabled;
     uint8_t selected_value;
     uint8_t selected_digit;
     int32_t last_encoder_steps;

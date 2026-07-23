@@ -3,10 +3,12 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include "board_io.h"
 #include "bluetooth_spp.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_check.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -17,6 +19,7 @@
 #define UART_RX_LINE_CHARS 128U
 #define RS485_DISPLAY_BYTES_WITH_ELLIPSIS 4U
 #define RS485_PACKET_TIMEOUT_MIN_US 2000LL
+#define UART_LINE_TIMEOUT_MIN_US 20000LL
 
 static portMUX_TYPE s_uart_text_lock = portMUX_INITIALIZER_UNLOCKED;
 static char s_uart_a_text[UART_DISPLAY_CHARS + 1U] = "";
@@ -25,14 +28,99 @@ static char s_uart_bt_out[UART_RX_LINE_CHARS * 3U + 16U];
 static uint32_t s_uart_a_errors;
 static QueueHandle_t s_uart_a_event_queue;
 static bool s_uart_ready;
+static bool s_uart_pins_active;
 static volatile app_mode_t s_active_mode = APP_MODE_POWER_SUPPLY;
 static volatile uint32_t s_active_baud = UART_TEST_BAUD;
+static uint16_t s_lin_mask_value;
+static uint8_t s_lin_mask_care;
+static bool s_bt_was_connected;
+static bool s_rs485_hint_sent;
+
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+static bool address_matches_mask(uint16_t address, uint8_t digits, uint16_t mask_value, uint8_t mask_care)
+{
+    if (mask_care == 0U) return true;
+    for (uint8_t i = 0U; i < digits; ++i) {
+        if ((mask_care & (uint8_t)(1U << i)) == 0U) continue;
+        uint8_t shift = (uint8_t)((digits - 1U - i) * 4U);
+        if (((address >> shift) & 0x0FU) != ((mask_value >> shift) & 0x0FU)) return false;
+    }
+    return true;
+}
+
+static uint8_t lin_line_address(const char *line)
+{
+    int hi = hex_value(line[0]);
+    int lo = hex_value(line[1]);
+    if (hi >= 0 && lo >= 0 &&
+        (line[2] == '\0' || line[2] == ' ' || line[2] == ':' || line[2] == ',')) {
+        return (uint8_t)((hi << 4) | lo);
+    }
+    return (uint8_t)line[0];
+}
 
 static int64_t rs485_packet_timeout_us(void)
 {
     uint32_t baud = s_active_baud == 0U ? UART_TEST_BAUD : s_active_baud;
     int64_t timeout = (int64_t)((40ULL * 1000000ULL + baud - 1ULL) / baud);
     return timeout < RS485_PACKET_TIMEOUT_MIN_US ? RS485_PACKET_TIMEOUT_MIN_US : timeout;
+}
+
+static int64_t uart_line_timeout_us(void)
+{
+    uint32_t baud = s_active_baud == 0U ? UART_TEST_BAUD : s_active_baud;
+    int64_t timeout = (int64_t)((40ULL * 1000000ULL + baud - 1ULL) / baud);
+    return timeout < UART_LINE_TIMEOUT_MIN_US ? UART_LINE_TIMEOUT_MIN_US : timeout;
+}
+
+static bool uart_protocol_mode(app_mode_t mode)
+{
+    return mode == APP_MODE_UART || mode == APP_MODE_LIN || mode == APP_MODE_RS485;
+}
+
+static void rs485_hint_update(app_mode_t mode, bool entering_rs485)
+{
+    bool bt_connected = bluetooth_spp_connected();
+    bool bt_connected_now = bt_connected && !s_bt_was_connected;
+
+    if (mode != APP_MODE_RS485 || !bt_connected) {
+        s_rs485_hint_sent = false;
+    }
+
+    if (mode == APP_MODE_RS485 && bt_connected && !s_rs485_hint_sent &&
+        (entering_rs485 || bt_connected_now)) {
+        static const char hint[] =
+            "[RS485 HINT] Set in Setting -> Send: Newline - None, Edit mode - HEX.\r\n";
+        bluetooth_spp_write(hint, sizeof(hint) - 1U);
+        s_rs485_hint_sent = true;
+    }
+
+    s_bt_was_connected = bt_connected;
+}
+
+static void uart_probe_set_pins_active(bool active)
+{
+    if (active == s_uart_pins_active) return;
+
+    if (active) {
+        if (uart_set_pin(UART_A_PORT, UART_A_TX_GPIO, UART_A_RX_GPIO,
+                         UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) == ESP_OK) {
+            s_uart_pins_active = true;
+        }
+        return;
+    }
+
+    (void)uart_wait_tx_done(UART_A_PORT, pdMS_TO_TICKS(20));
+    (void)gpio_set_direction(UART_A_TX_GPIO, GPIO_MODE_INPUT);
+    (void)gpio_set_direction(UART_A_RX_GPIO, GPIO_MODE_INPUT);
+    s_uart_pins_active = false;
 }
 
 /* uart_preview_store
@@ -60,6 +148,11 @@ static void uart_line_store_and_forward(const char *line, bool truncated)
     char preview[UART_DISPLAY_CHARS + 1U];
     size_t length = strlen(line);
 
+    if (s_active_mode == APP_MODE_LIN &&
+        !address_matches_mask(lin_line_address(line), 2U, s_lin_mask_value, s_lin_mask_care)) {
+        return;
+    }
+
     if (length > UART_PREVIEW_CHARS || truncated) {
         memcpy(preview, line, UART_PREVIEW_CHARS);
         memcpy(preview + UART_PREVIEW_CHARS, "...", 4U);
@@ -68,9 +161,11 @@ static void uart_line_store_and_forward(const char *line, bool truncated)
     }
     uart_preview_store(preview);
 
-    if (s_active_mode == APP_MODE_UART && bluetooth_spp_connected()) {
+    if ((s_active_mode == APP_MODE_UART || s_active_mode == APP_MODE_LIN) &&
+        bluetooth_spp_connected()) {
         char out[UART_RX_LINE_CHARS + 16U];
-        int written = snprintf(out, sizeof(out), "[UART]%s\r\n", line);
+        const char *prefix = s_active_mode == APP_MODE_LIN ? "[LIN]" : "[UART]";
+        int written = snprintf(out, sizeof(out), "%s%s\r\n", prefix, line);
         if (written > 0) {
             size_t length = (size_t)written;
             if (length >= sizeof(out)) length = sizeof(out) - 1U;
@@ -180,6 +275,7 @@ static void uart_a_rx_task(void *argument)
     bool truncated = false;
     bool packet_truncated = false;
     int64_t last_rs485_byte_us = 0;
+    int64_t last_uart_byte_us = 0;
     app_mode_t observed_mode = s_active_mode;
     uart_event_t event;
     uint8_t bytes[64];
@@ -200,6 +296,13 @@ static void uart_a_rx_task(void *argument)
                 rs485_packet_store_and_forward(packet, packet_used, packet_truncated);
                 packet_used = 0U;
                 packet_truncated = false;
+            } else if ((s_active_mode == APP_MODE_UART || s_active_mode == APP_MODE_LIN) &&
+                       used != 0U &&
+                       esp_timer_get_time() - last_uart_byte_us >= uart_line_timeout_us()) {
+                line[used] = '\0';
+                uart_line_store_and_forward(line, truncated);
+                used = 0U;
+                truncated = false;
             }
             continue;
         }
@@ -241,6 +344,7 @@ static void uart_a_rx_task(void *argument)
                         } else {
                             truncated = true;
                         }
+                        last_uart_byte_us = esp_timer_get_time();
                     }
                 }
                 break;
@@ -269,24 +373,12 @@ static void uart_a_rx_task(void *argument)
     }
 }
 
-static void uart_a_tx_task(void *argument)
-{
-    (void)argument;
-    uint32_t counter = 0U;
-    char line[20];
-
-    while (true) {
-        int length = snprintf(line, sizeof(line), "Test%lu\r\n", (unsigned long)counter);
-        if (s_active_mode == APP_MODE_UART && length > 0) uart_probe_write_bytes(line, (size_t)length);
-        counter = counter >= 100U ? 0U : counter + 1U;
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
 /* uart_probe_init
  * Inputs: none.
  * Returns: ESP_OK on success, or an ESP-IDF error from UART setup.
- * Does: initializes UART A on IO18/IO19 and starts RX preview plus test TX.
+ * Does: initializes UART A and starts RX preview plus test TX. Pins are only
+ * assigned while a UART/LIN/RS485 mode is active, because Engineering Sample
+ * shares IO13 with the power-screen frequency counter.
  */
 esp_err_t uart_probe_init(void)
 {
@@ -302,21 +394,26 @@ esp_err_t uart_probe_init(void)
     ESP_RETURN_ON_ERROR(uart_driver_install(UART_A_PORT, 1024, 256, 20, &s_uart_a_event_queue, 0),
                         "uart_probe", "install UART A");
     ESP_RETURN_ON_ERROR(uart_param_config(UART_A_PORT, &config), "uart_probe", "config UART A");
-    ESP_RETURN_ON_ERROR(uart_set_pin(UART_A_PORT, UART_A_TX_GPIO, UART_A_RX_GPIO,
-                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),
-                        "uart_probe", "pins UART A");
-
     xTaskCreate(uart_a_rx_task, "uart_a_rx", 4096, NULL, 5, NULL);
     s_uart_ready = true;
-    xTaskCreate(uart_a_tx_task, "uart_a_tx", 2048, NULL, 4, NULL);
     return ESP_OK;
 }
 
-void uart_probe_configure(app_mode_t mode, uint32_t uart_baud, uint32_t rs485_baud)
+void uart_probe_configure(app_mode_t mode,
+                          uint32_t uart_baud,
+                          uint32_t lin_baud,
+                          uint32_t rs485_baud,
+                          uint16_t lin_mask_value,
+                          uint8_t lin_mask_care)
 {
-    uint32_t baud = mode == APP_MODE_RS485 ? rs485_baud : uart_baud;
+    uint32_t baud = mode == APP_MODE_RS485 ? rs485_baud :
+                    mode == APP_MODE_LIN ? lin_baud : uart_baud;
+    s_lin_mask_value = lin_mask_value;
+    s_lin_mask_care = lin_mask_care;
 
-    if (mode != APP_MODE_UART && mode != APP_MODE_RS485) {
+    if (!uart_protocol_mode(mode)) {
+        uart_probe_set_pins_active(false);
+        rs485_hint_update(mode, false);
         if (mode != s_active_mode) {
             portENTER_CRITICAL(&s_uart_text_lock);
             memset(s_uart_a_lines, 0, sizeof(s_uart_a_lines));
@@ -327,6 +424,8 @@ void uart_probe_configure(app_mode_t mode, uint32_t uart_baud, uint32_t rs485_ba
         return;
     }
 
+    uart_probe_set_pins_active(true);
+
     if (baud == 0U) baud = UART_TEST_BAUD;
     if (s_uart_ready && baud != s_active_baud) {
         if (uart_wait_tx_done(UART_A_PORT, pdMS_TO_TICKS(20)) == ESP_OK &&
@@ -336,6 +435,8 @@ void uart_probe_configure(app_mode_t mode, uint32_t uart_baud, uint32_t rs485_ba
     } else if (!s_uart_ready) {
         s_active_baud = baud;
     }
+
+    rs485_hint_update(mode, mode == APP_MODE_RS485 && s_active_mode != APP_MODE_RS485);
 
     if (mode != s_active_mode) {
         portENTER_CRITICAL(&s_uart_text_lock);
@@ -365,5 +466,18 @@ void uart_probe_update(app_state_t *state)
 void uart_probe_write_bytes(const char *data, size_t length)
 {
     if (!s_uart_ready || data == NULL || length == 0U) return;
+
+    if (s_active_mode == APP_MODE_RS485) {
+        board_io_set_rs485_tx_enabled(true);
+        esp_rom_delay_us(20U);
+    }
+
     uart_write_bytes(UART_A_PORT, data, length);
+
+    if (s_active_mode == APP_MODE_RS485) {
+        uint32_t baud = s_active_baud == 0U ? UART_TEST_BAUD : s_active_baud;
+        uint32_t timeout_ms = (uint32_t)((length * 12ULL * 1000ULL + baud - 1ULL) / baud) + 10U;
+        (void)uart_wait_tx_done(UART_A_PORT, pdMS_TO_TICKS(timeout_ms));
+        board_io_set_rs485_tx_enabled(false);
+    }
 }

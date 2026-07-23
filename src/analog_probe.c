@@ -4,6 +4,7 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_check.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "probe_config.h"
 
@@ -17,8 +18,10 @@
 
 static adc_oneshot_unit_handle_t adc_unit;
 static adc_cali_handle_t adc_cal;
+static const char *TAG = "analog";
 
 static uint32_t last_sample_us;
+static uint32_t last_log_us;
 
 static uint64_t sum_probe_mv;
 static uint32_t sum_adc_mv;
@@ -128,12 +131,22 @@ void analog_probe_update(app_state_t *app, bool timing_quiet)
     uint32_t adc_avg_mv = (sum_adc_mv + sample_count / 2U) / sample_count;
 
     app->analog.adc_mv = adc_avg_mv;
+    app->analog.input_mv = avg_mv;
+    if (now_us - last_log_us >= 1000000U) {
+        last_log_us = now_us;
+        ESP_LOGI(TAG, "VIN IO36 adc=%lu mV input=%lu mV",
+                 (unsigned long)adc_avg_mv,
+                 (unsigned long)avg_mv);
+    }
+
+#if LOGIC_V2_BOARD_REV != LOGIC_V2_BOARD_ENGINEERING_SAMPLE
     app->analog.voltage_mv = avg_mv;
     app->analog.vpp_mv = 0;
     app->analog.test_span_mv = 0;
     app->analog.bias_current_na = 0;
     app->analog.test_visible = false;
     app->analog.logic_state = PROBE_UNDEFINED;
+#endif
 
     clear_window();
 }

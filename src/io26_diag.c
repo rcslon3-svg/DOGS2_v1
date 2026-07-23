@@ -29,6 +29,16 @@ static bool s_ledc_active;
 static bool s_uart_active;
 static uint32_t s_uart_baud;
 
+static uint64_t io26_gpio_mask(void)
+{
+#if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
+    return 0ULL;
+#else
+    if (PROBE_TEST_SIGNAL_GPIO == GPIO_NUM_NC) return 0ULL;
+    return 1ULL << PROBE_TEST_SIGNAL_GPIO;
+#endif
+}
+
 /* send_response
  * Inputs:
  *   text - zero-terminated response string.
@@ -78,8 +88,10 @@ static void io26_stop_peripherals(void)
 static void io26_high_z(void)
 {
     io26_stop_peripherals();
+    uint64_t pin_mask = io26_gpio_mask();
+    if (pin_mask == 0ULL) return;
     gpio_config_t pin = {
-        .pin_bit_mask = 1ULL << PROBE_TEST_SIGNAL_GPIO,
+        .pin_bit_mask = pin_mask,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -156,8 +168,10 @@ static void slow_timer_callback(void *argument)
  */
 static void configure_io26_gpio_output(void)
 {
+    uint64_t pin_mask = io26_gpio_mask();
+    if (pin_mask == 0ULL) return;
     gpio_config_t pin = {
-        .pin_bit_mask = 1ULL << PROBE_TEST_SIGNAL_GPIO,
+        .pin_bit_mask = pin_mask,
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,

@@ -10,6 +10,7 @@
 #include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -23,8 +24,9 @@
 #define I2C_SNIFFER_TOKEN_BYTE_NACK_BASE 0x100U
 #define I2C_SNIFFER_TOKEN_START 0x200U
 #define I2C_SNIFFER_TOKEN_STOP 0x201U
-#define I2C_SNIFFER_DEBUG_ALWAYS 1
+#define I2C_SNIFFER_DEBUG_ALWAYS 0
 #define I2C_SNIFFER_DEBUG_LOG 1
+#define I2C_SNIFFER_PUBLISH_MIN_US 50000LL
 
 typedef struct {
     uint16_t events[I2C_SNIFFER_EVENT_BUFFER_LEN];
@@ -42,8 +44,8 @@ static i2c_sniffer_event_buffer_t s_event_buffers[I2C_SNIFFER_EVENT_BUFFER_COUNT
 static QueueHandle_t s_ready_queue;
 static const char *TAG = "i2c_sniff";
 static portMUX_TYPE s_text_lock = portMUX_INITIALIZER_UNLOCKED;
-static char s_text[UART_DISPLAY_CHARS + 1U] = "";
-static char s_lines[3][UART_DISPLAY_CHARS + 1U] = {{0}};
+static char s_text[I2C_DISPLAY_CHARS + 1U] = "";
+static char s_lines[4][I2C_DISPLAY_CHARS + 1U] = {{0}};
 static uint32_t s_packets;
 static uint32_t s_errors;
 static volatile uint32_t s_isr_errors;
@@ -54,17 +56,21 @@ static volatile uint8_t s_last_sda = 1U;
 static volatile uint8_t s_last_scl = 1U;
 static volatile uint8_t s_current_byte;
 static volatile uint8_t s_bit_count;
+static uint16_t s_mask_value;
+static uint8_t s_mask_care;
+static int64_t s_last_publish_us;
 
 static void store_preview(const char *line)
 {
     size_t length = strlen(line);
-    if (length > UART_DISPLAY_CHARS) length = UART_DISPLAY_CHARS;
+    if (length > I2C_DISPLAY_CHARS) length = I2C_DISPLAY_CHARS;
 
     portENTER_CRITICAL(&s_text_lock);
     memcpy(s_lines[0], s_lines[1], sizeof(s_lines[0]));
     memcpy(s_lines[1], s_lines[2], sizeof(s_lines[1]));
-    memcpy(s_lines[2], line, length);
-    s_lines[2][length] = '\0';
+    memcpy(s_lines[2], s_lines[3], sizeof(s_lines[2]));
+    memcpy(s_lines[3], line, length);
+    s_lines[3][length] = '\0';
     memcpy(s_text, line, length + 1U);
     ++s_packets;
     portEXIT_CRITICAL(&s_text_lock);
@@ -205,6 +211,124 @@ static bool append_text(char *out, size_t out_size, size_t *used, const char *fo
     return true;
 }
 
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+static bool parse_hex_byte_token(const char **cursor, uint8_t *value)
+{
+    while (**cursor == ' ') ++(*cursor);
+    int hi = hex_value((*cursor)[0]);
+    int lo = hex_value((*cursor)[1]);
+    if (hi < 0 || lo < 0) return false;
+    if ((*cursor)[2] != '\0' && (*cursor)[2] != ' ') return false;
+    *value = (uint8_t)((hi << 4) | lo);
+    *cursor += 2;
+    return true;
+}
+
+static bool address_matches_mask(uint16_t address, uint8_t digits, uint16_t mask_value, uint8_t mask_care)
+{
+    if (mask_care == 0U) return true;
+    for (uint8_t i = 0U; i < digits; ++i) {
+        if ((mask_care & (uint8_t)(1U << i)) == 0U) continue;
+        uint8_t shift = (uint8_t)((digits - 1U - i) * 4U);
+        if (((address >> shift) & 0x0FU) != ((mask_value >> shift) & 0x0FU)) return false;
+    }
+    return true;
+}
+
+static bool parse_ack_token(const char **cursor)
+{
+    while (**cursor == ' ') ++(*cursor);
+    char c = **cursor;
+    if (c != 'A' && c != 'N') return false;
+    ++(*cursor);
+    return **cursor == '\0' || **cursor == ' ';
+}
+
+static bool line_matches_i2c_mask(const char *line)
+{
+    const char *cursor = line;
+    if (memcmp(cursor, "[I2C]", 5U) == 0) cursor += 5;
+    if (s_mask_care == 0U) return true;
+
+    while (*cursor != '\0') {
+        while (*cursor == ' ') ++cursor;
+        if (*cursor == 'S') {
+            ++cursor;
+            continue;
+        }
+        if (*cursor == 'W' || *cursor == 'R') {
+            ++cursor;
+            uint8_t address = 0U;
+            if (!parse_hex_byte_token(&cursor, &address)) return false;
+            if (address_matches_mask(address, 2U, s_mask_value, s_mask_care)) return true;
+            (void)parse_ack_token(&cursor);
+            continue;
+        }
+        uint8_t data = 0U;
+        if (!parse_hex_byte_token(&cursor, &data) || !parse_ack_token(&cursor)) return false;
+    }
+    return false;
+}
+
+static bool publish_rate_allowed(void)
+{
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_publish_us < I2C_SNIFFER_PUBLISH_MIN_US) return false;
+    s_last_publish_us = now;
+    return true;
+}
+
+static bool validate_line(const char *line)
+{
+    const char *cursor = line;
+    if (memcmp(cursor, "[I2C]", 5U) == 0) cursor += 5;
+
+    bool expect_address = true;
+    bool saw_address = false;
+    bool saw_stop = false;
+
+    while (*cursor != '\0') {
+        while (*cursor == ' ') ++cursor;
+        if (*cursor == '\0') break;
+
+        if (*cursor == 'S') {
+            ++cursor;
+            expect_address = true;
+            continue;
+        }
+        if (*cursor == 'P') {
+            ++cursor;
+            saw_stop = true;
+            while (*cursor == ' ') ++cursor;
+            return *cursor == '\0' && saw_address;
+        }
+        if (*cursor == 'W' || *cursor == 'R') {
+            ++cursor;
+            uint8_t address = 0U;
+            if (!expect_address || !parse_hex_byte_token(&cursor, &address) || !parse_ack_token(&cursor)) {
+                return false;
+            }
+            saw_address = true;
+            expect_address = false;
+            continue;
+        }
+
+        uint8_t data = 0U;
+        if (expect_address || !parse_hex_byte_token(&cursor, &data) || !parse_ack_token(&cursor)) {
+            return false;
+        }
+    }
+
+    return saw_address && saw_stop;
+}
+
 static void store_line(const char *line)
 {
     static uint32_t debug_log_count;
@@ -214,6 +338,9 @@ static void store_line(const char *line)
         preview = line + 5U;
     }
 
+    if (!validate_line(line)) return;
+    if (!line_matches_i2c_mask(line)) return;
+    if (s_mask_care == 0U && !publish_rate_allowed()) return;
     store_preview(preview);
 
 #if I2C_SNIFFER_DEBUG_LOG
@@ -223,8 +350,11 @@ static void store_line(const char *line)
     }
 #endif
     if (s_active_mode != APP_MODE_I2C || !bluetooth_spp_connected()) return;
-    bluetooth_spp_write(line, length);
-    bluetooth_spp_write("\r\n", 2U);
+    char bt_line[I2C_SNIFFER_PACKET_TEXT_LEN + 2U];
+    if (length > I2C_SNIFFER_PACKET_TEXT_LEN) length = I2C_SNIFFER_PACKET_TEXT_LEN;
+    memcpy(bt_line, line, length);
+    memcpy(bt_line + length, "\r\n", 2U);
+    bluetooth_spp_write(bt_line, length + 2U);
 }
 
 static void publish_line(char *text, size_t length, bool truncated)
@@ -359,8 +489,10 @@ esp_err_t i2c_sniffer_init(void)
 #endif
 }
 
-void i2c_sniffer_configure(app_mode_t mode)
+void i2c_sniffer_configure(app_mode_t mode, uint16_t mask_value, uint8_t mask_care)
 {
+    s_mask_value = mask_value;
+    s_mask_care = mask_care;
     if (mode != s_active_mode) {
         if (mode == APP_MODE_I2C || s_active_mode == APP_MODE_I2C) {
             if (s_ready_queue != NULL) xQueueReset(s_ready_queue);

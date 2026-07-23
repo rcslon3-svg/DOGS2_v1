@@ -5,4 +5,4 @@
 
 esp_err_t channelA_init(void);
 void channelA_i2c_release(void);
-void channelA_update(app_state_t *state, int64_t now_us);
+void channelA_update(app_state_t *state, int64_t now_us, bool channel_enabled);

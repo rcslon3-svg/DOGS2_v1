@@ -7,10 +7,64 @@
 #include "esp_check.h"
 #include "esp_gap_bt_api.h"
 #include "esp_spp_api.h"
+#include "freertos/FreeRTOS.h"
 #include "probe_config.h"
 
+#define BLUETOOTH_SPP_TX_BUFFER_SIZE 512U
+#define BLUETOOTH_SPP_TX_QUEUE_DEPTH 16U
+
 static uint32_t s_client_handle;
+static bool s_write_busy;
+static uint8_t s_write_buffer[BLUETOOTH_SPP_TX_BUFFER_SIZE];
+static uint8_t s_tx_queue[BLUETOOTH_SPP_TX_QUEUE_DEPTH][BLUETOOTH_SPP_TX_BUFFER_SIZE];
+static uint16_t s_tx_queue_length[BLUETOOTH_SPP_TX_QUEUE_DEPTH];
+static uint8_t s_tx_queue_head;
+static uint8_t s_tx_queue_tail;
+static uint8_t s_tx_queue_count;
+static portMUX_TYPE s_tx_lock = portMUX_INITIALIZER_UNLOCKED;
 static bluetooth_command_cb_t s_command_callback;
+
+static void tx_queue_clear(void)
+{
+    portENTER_CRITICAL(&s_tx_lock);
+    s_write_busy = false;
+    s_tx_queue_head = 0U;
+    s_tx_queue_tail = 0U;
+    s_tx_queue_count = 0U;
+    portEXIT_CRITICAL(&s_tx_lock);
+}
+
+static bool tx_prepare_next(uint32_t *handle, uint16_t *length)
+{
+    bool ready = false;
+
+    portENTER_CRITICAL(&s_tx_lock);
+    if (s_client_handle != 0U && !s_write_busy && s_tx_queue_count != 0U) {
+        *handle = s_client_handle;
+        *length = s_tx_queue_length[s_tx_queue_head];
+        memcpy(s_write_buffer, s_tx_queue[s_tx_queue_head], *length);
+        s_tx_queue_head = (uint8_t)((s_tx_queue_head + 1U) % BLUETOOTH_SPP_TX_QUEUE_DEPTH);
+        --s_tx_queue_count;
+        s_write_busy = true;
+        ready = true;
+    }
+    portEXIT_CRITICAL(&s_tx_lock);
+
+    return ready;
+}
+
+static void tx_kick(void)
+{
+    uint32_t handle = 0U;
+    uint16_t length = 0U;
+    if (!tx_prepare_next(&handle, &length)) return;
+
+    if (esp_spp_write(handle, (int)length, s_write_buffer) != ESP_OK) {
+        portENTER_CRITICAL(&s_tx_lock);
+        s_write_busy = false;
+        portEXIT_CRITICAL(&s_tx_lock);
+    }
+}
 
 /* Bluedroid owns this callback.  Connection events only update the active SPP
  * handle; received bytes are handed to the application's non-blocking queue. */
@@ -30,9 +84,17 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *parameter
             break;
         case ESP_SPP_SRV_OPEN_EVT:
             s_client_handle = parameter->srv_open.handle;
+            tx_queue_clear();
             break;
         case ESP_SPP_CLOSE_EVT:
             s_client_handle = 0U;
+            tx_queue_clear();
+            break;
+        case ESP_SPP_WRITE_EVT:
+            portENTER_CRITICAL(&s_tx_lock);
+            s_write_busy = false;
+            portEXIT_CRITICAL(&s_tx_lock);
+            tx_kick();
             break;
         case ESP_SPP_DATA_IND_EVT:
             if (s_command_callback != NULL) {
@@ -87,6 +149,31 @@ void bluetooth_spp_write(const char *data, size_t length)
 {
     /* Dropping telemetry while disconnected is intentional: measurement must
      * never wait for a phone, and old samples have no value after reconnect. */
-    if (s_client_handle == 0U || data == NULL || length == 0U) return;
-    esp_spp_write(s_client_handle, (int)length, (uint8_t *)data);
+    if (data == NULL || length == 0U) return;
+    if (length > sizeof(s_write_buffer)) length = sizeof(s_write_buffer);
+
+    bool send_now = false;
+    uint32_t handle = 0U;
+    portENTER_CRITICAL(&s_tx_lock);
+    if (s_client_handle != 0U) {
+        if (!s_write_busy && s_tx_queue_count == 0U) {
+            memcpy(s_write_buffer, data, length);
+            s_write_busy = true;
+            handle = s_client_handle;
+            send_now = true;
+        } else if (s_tx_queue_count < BLUETOOTH_SPP_TX_QUEUE_DEPTH) {
+            memcpy(s_tx_queue[s_tx_queue_tail], data, length);
+            s_tx_queue_length[s_tx_queue_tail] = (uint16_t)length;
+            s_tx_queue_tail = (uint8_t)((s_tx_queue_tail + 1U) % BLUETOOTH_SPP_TX_QUEUE_DEPTH);
+            ++s_tx_queue_count;
+        }
+    }
+    portEXIT_CRITICAL(&s_tx_lock);
+
+    if (send_now && esp_spp_write(handle, (int)length, s_write_buffer) != ESP_OK) {
+        portENTER_CRITICAL(&s_tx_lock);
+        s_write_busy = false;
+        portEXIT_CRITICAL(&s_tx_lock);
+        tx_kick();
+    }
 }

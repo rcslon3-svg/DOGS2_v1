@@ -9,7 +9,7 @@
 /*
  * Frequency input.
  *
- * IO22 is connected to the ESP32 PCNT peripheral.
+ * FREQUENCY_INPUT_GPIO is connected to the ESP32 PCNT peripheral.
  * PCNT counts rising edges in hardware. The CPU does not receive an interrupt
  * on every edge.
  *
@@ -41,7 +41,7 @@ esp_err_t timing_input_init(void)
                         "timing", "pcnt high watch");
 
     pcnt_chan_config_t channel_config = {
-        .edge_gpio_num = PROBE_COMPARATOR_GPIO,
+        .edge_gpio_num = FREQUENCY_INPUT_GPIO,
         .level_gpio_num = -1,
     };
     pcnt_channel_handle_t channel = NULL;

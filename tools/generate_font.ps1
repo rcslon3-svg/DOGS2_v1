@@ -3,15 +3,12 @@ param(
 )
 
 # This utility is intentionally not part of the firmware build.  It converts
-# the OFL-licensed Roboto variable font to compact, four-bit alpha masks.  The
+# the Windows Bahnschrift font to compact, four-bit alpha masks.  The
 # generated C files are then compiled like any other static firmware asset.
 Add-Type -AssemblyName System.Drawing
 
-$fontUrl = 'https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto%5Bwdth%2Cwght%5D.ttf'
-$fontFile = Join-Path $PSScriptRoot 'Roboto.ttf'
-if (-not (Test-Path -LiteralPath $fontFile)) {
-    Invoke-WebRequest -Uri $fontUrl -OutFile $fontFile -UseBasicParsing
-}
+$fontFile = Join-Path $env:WINDIR 'Fonts\bahnschrift.ttf'
+if (-not (Test-Path -LiteralPath $fontFile)) { throw "Bahnschrift font not found: $fontFile" }
 
 $privateFonts = New-Object System.Drawing.Text.PrivateFontCollection
 $privateFonts.AddFontFile($fontFile)
@@ -73,8 +70,9 @@ function Convert-Font([string]$prefix, [single]$pointSize) {
     return @{ Prefix=$prefix; Height=[Math]::Ceiling($pointSize * 1.25); Data=$dataLines; Glyphs=$glyphLines }
 }
 
-$small = Convert-Font 'roboto_18' 18
-$large = Convert-Font 'roboto_30' 30
+$tiny = Convert-Font 'instrument_14' 14
+$small = Convert-Font 'instrument_18' 18
+$large = Convert-Font 'instrument_30' 30
 
 $header = @"
 #pragma once
@@ -97,30 +95,39 @@ typedef struct {
     uint8_t line_height;
 } smooth_font_t;
 
-extern const smooth_font_t roboto_18;
-extern const smooth_font_t roboto_30;
+extern const smooth_font_t instrument_18;
+extern const smooth_font_t instrument_30;
+extern const smooth_font_t instrument_14;
 "@
 
 $source = @"
 #include "smooth_font.h"
 
-static const uint8_t roboto_18_bitmap[] = {
+static const uint8_t instrument_14_bitmap[] = {
+$($tiny.Data -join "`n")
+};
+static const smooth_glyph_t instrument_14_glyphs[] = {
+$($tiny.Glyphs -join ",`n")
+};
+const smooth_font_t instrument_14 = {instrument_14_bitmap, instrument_14_glyphs, 32, 126, $($tiny.Height)};
+
+static const uint8_t instrument_18_bitmap[] = {
 $($small.Data -join "`n")
 };
-static const smooth_glyph_t roboto_18_glyphs[] = {
+static const smooth_glyph_t instrument_18_glyphs[] = {
 $($small.Glyphs -join ",`n")
 };
-const smooth_font_t roboto_18 = {roboto_18_bitmap, roboto_18_glyphs, 32, 126, $($small.Height)};
+const smooth_font_t instrument_18 = {instrument_18_bitmap, instrument_18_glyphs, 32, 126, $($small.Height)};
 
-static const uint8_t roboto_30_bitmap[] = {
+static const uint8_t instrument_30_bitmap[] = {
 $($large.Data -join "`n")
 };
-static const smooth_glyph_t roboto_30_glyphs[] = {
+static const smooth_glyph_t instrument_30_glyphs[] = {
 $($large.Glyphs -join ",`n")
 };
-const smooth_font_t roboto_30 = {roboto_30_bitmap, roboto_30_glyphs, 32, 126, $($large.Height)};
+const smooth_font_t instrument_30 = {instrument_30_bitmap, instrument_30_glyphs, 32, 126, $($large.Height)};
 "@
 
 [IO.File]::WriteAllText((Join-Path $ProjectRoot 'include\smooth_font.h'), $header, [Text.UTF8Encoding]::new($false))
 [IO.File]::WriteAllText((Join-Path $ProjectRoot 'src\smooth_font.c'), $source, [Text.UTF8Encoding]::new($false))
-Write-Host "Generated Roboto fonts: $($small.Data.Count + $large.Data.Count) data rows"
+Write-Host "Generated Bahnschrift instrument fonts: $($tiny.Data.Count + $small.Data.Count + $large.Data.Count) data rows"

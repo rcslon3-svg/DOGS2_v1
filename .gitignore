@@ -6,3 +6,5 @@
 sdkconfig*
 !sdkconfig.defaults
 tools/Roboto.ttf
+*.log
+splash_preview.png

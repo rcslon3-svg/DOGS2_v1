@@ -62,6 +62,7 @@ static i2c_master_dev_handle_t s_lm51772;
 static const char *TAG = "channelB";
 static bool s_error_seen;
 static bool s_output_programmed;
+static bool s_last_output_enabled;
 static uint16_t s_last_target_mv;
 static uint16_t s_last_target_ma;
 static uint16_t s_last_command_mv;
@@ -290,6 +291,7 @@ esp_err_t channelB_init(void)
     (void)write_u8(LM51772_REG_VOUT_LSB, 0);
     (void)write_u8(LM51772_REG_VOUT_MSB, 0);
     s_output_programmed = false;
+    s_last_output_enabled = false;
     s_last_command_mv = 0U;
     s_trim_mv = 0;
     return ESP_OK;
@@ -308,6 +310,7 @@ void channelB_i2c_release(void)
         s_lm51772 = NULL;
     }
     s_output_programmed = false;
+    s_last_output_enabled = false;
     s_last_command_mv = 0U;
     s_trim_mv = 0;
 }
@@ -320,14 +323,14 @@ void channelB_i2c_release(void)
  * Returns: none.
  * Does: writes channel-B setpoints to LM51772 and reads back status.
  */
-void channelB_update(app_state_t *state, int64_t now_us)
+void channelB_update(app_state_t *state, int64_t now_us, bool channel_enabled)
 {
     (void)now_us;
 
     uint16_t target_mv = state->control.u1_mv;
     uint16_t target_ma = state->control.i1_ma;
     if (target_ma > CHANNEL_B_CURRENT_LIMIT_MAX_MA) target_ma = CHANNEL_B_CURRENT_LIMIT_MAX_MA;
-    bool output_enabled = target_mv >= LM51772_VOUT_LOW_MIN_MV;
+    bool output_enabled = channel_enabled && target_mv >= LM51772_VOUT_LOW_MIN_MV;
     uint16_t command_mv = corrected_target_mv(target_mv,
                                               output_enabled,
                                               state->lm51772.current_limit_active,
@@ -343,19 +346,39 @@ void channelB_update(app_state_t *state, int64_t now_us)
     uint8_t vout_lsb = (uint8_t)(vout_code & 0xFFU);
     uint8_t vout_msb = (uint8_t)((vout_code >> 8) & 0x0FU);
 
-    if (!s_output_programmed ||
-        target_mv != s_last_target_mv ||
-        target_ma != s_last_target_ma ||
-        command_mv != s_last_command_mv) {
+    if (s_last_output_enabled && !output_enabled) {
+        esp_err_t err = ESP_OK;
+        if ((err = update_bits(LM51772_REG_CTRL_81, LM51772_CTRL_CONV_EN, 0U)) != ESP_OK ||
+            (err = update_bits(LM51772_REG_CTRL_D0, LM51772_CTRL_CONV_EN, 0U)) != ESP_OK) {
+            state->lm51772.last_error = err;
+            state->lm51772.valid = false;
+            state->lm51772.status_valid = false;
+            state->lm51772.limit_valid = false;
+            state->lm51772.current_limit_active = false;
+            s_error_seen = true;
+            return;
+        }
+        s_last_target_mv = target_mv;
+        s_last_target_ma = target_ma;
+        s_last_command_mv = command_mv;
+        s_last_output_enabled = false;
+        s_output_programmed = true;
+    } else if (!s_output_programmed ||
+               target_mv != s_last_target_mv ||
+               target_ma != s_last_target_ma ||
+               command_mv != s_last_command_mv ||
+               output_enabled != s_last_output_enabled) {
         esp_err_t err = ESP_OK;
         if ((err = update_bits(LM51772_REG_CONFIG_D9, LM51772_D9_SEL_ISET_PIN, 0)) != ESP_OK ||
             (err = write_u8(LM51772_REG_CUR_LIM, ilim_code)) != ESP_OK ||
             (err = write_u8(LM51772_REG_VOUT_LSB, vout_lsb)) != ESP_OK ||
             (err = write_u8(LM51772_REG_VOUT_MSB, vout_msb)) != ESP_OK ||
-            (output_enabled &&
-             (err = update_bits(LM51772_REG_CTRL_81, LM51772_CTRL_CONV_EN, LM51772_CTRL_CONV_EN)) != ESP_OK) ||
-            (output_enabled &&
-             (err = update_bits(LM51772_REG_CTRL_D0, LM51772_CTRL_CONV_EN, LM51772_CTRL_CONV_EN)) != ESP_OK)) {
+            (err = update_bits(LM51772_REG_CTRL_81,
+                               LM51772_CTRL_CONV_EN,
+                               output_enabled ? LM51772_CTRL_CONV_EN : 0U)) != ESP_OK ||
+            (err = update_bits(LM51772_REG_CTRL_D0,
+                               LM51772_CTRL_CONV_EN,
+                               output_enabled ? LM51772_CTRL_CONV_EN : 0U)) != ESP_OK) {
             state->lm51772.last_error = err;
             state->lm51772.valid = false;
             state->lm51772.status_valid = false;
@@ -368,6 +391,7 @@ void channelB_update(app_state_t *state, int64_t now_us)
         s_last_target_mv = target_mv;
         s_last_target_ma = target_ma;
         s_last_command_mv = command_mv;
+        s_last_output_enabled = output_enabled;
         s_output_programmed = true;
     }
 
