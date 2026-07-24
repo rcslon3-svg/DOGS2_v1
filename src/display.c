@@ -41,6 +41,13 @@
 #define POWER_CURRENT_RIGHT 238
 #define POWER_SIDE_FRAME_X 248
 #define POWER_SIDE_FRAME_WIDTH 66
+#define INTERFACE_MAIN_FRAME_WIDTH 268
+#define INTERFACE_MAIN_INNER_RIGHT 272
+#define INTERFACE_SIDE_FRAME_X 280
+#define INTERFACE_SIDE_FRAME_WIDTH 34
+#define INTERFACE_SIDE_INNER_X (INTERFACE_SIDE_FRAME_X + 2)
+#define INTERFACE_SIDE_INNER_RIGHT \
+    (INTERFACE_SIDE_FRAME_X + INTERFACE_SIDE_FRAME_WIDTH - 2)
 #define TFT_BACKLIGHT_LEDC_MODE LEDC_HIGH_SPEED_MODE
 #define TFT_BACKLIGHT_LEDC_TIMER LEDC_TIMER_3
 #define TFT_BACKLIGHT_LEDC_CHANNEL LEDC_CHANNEL_7
@@ -963,7 +970,10 @@ static void draw_channel_set_line(int y,
                             POWER_CHANNEL_INNER_X, POWER_CHANNEL_INNER_RIGHT);
 }
 
-static void draw_compact_actual_line(int y, char channel, const app_ina238_channel_t *measurement)
+static void draw_compact_actual_line_to(int y,
+                                        char channel,
+                                        const app_ina238_channel_t *measurement,
+                                        int panel_right)
 {
     char line[64] = "";
     uint16_t fg[64];
@@ -991,14 +1001,14 @@ static void draw_compact_actual_line(int y, char channel, const app_ina238_chann
     append_colored(line, fg, bg, &pos, "A", COLOR_CYAN);
 
     draw_rich_text_on_panel_clipped(10, y, line, &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, TFT_WIDTH - 8,
+                                    COLOR_PANEL, 8, panel_right,
                                     126, 167);
 }
 
-static void draw_bottom_actuals(const app_state_t *s)
+static void draw_bottom_actuals_to(const app_state_t *s, int panel_right)
 {
-    draw_compact_actual_line(126, 'A', &s->ina238.channel[0]);
-    draw_compact_actual_line(148, 'B', &s->ina238.channel[1]);
+    draw_compact_actual_line_to(126, 'A', &s->ina238.channel[0], panel_right);
+    draw_compact_actual_line_to(148, 'B', &s->ina238.channel[1], panel_right);
 }
 
 static void draw_highlighted_value_line(int y,
@@ -1159,7 +1169,59 @@ static void draw_generator_screen(const app_state_t *s, bool draw_frame)
     draw_generator_actual_line(145, 'B', &s->ina238.channel[1]);
 }
 
-static void draw_serial_header(const app_state_t *s, const char *title, uint32_t rate, uint8_t select)
+static void draw_interface_side_label(const char *label, int frame_y)
+{
+    uint16_t fg[8];
+    uint16_t bg[8];
+    size_t length = strlen(label);
+    if (length == 0U) return;
+
+    fill_text_colors(fg, bg, 8U);
+    for (size_t i = 0U; i < length && i < 8U; ++i) fg[i] = COLOR_GREEN;
+    int width = INTERFACE_SIDE_INNER_RIGHT - INTERFACE_SIDE_INNER_X;
+    int x = INTERFACE_SIDE_INNER_X +
+            (width - text_width(label, &instrument_14)) / 2;
+    int y = text_visual_y(label, &instrument_14, frame_y, 20);
+    draw_rich_text_on_panel_clipped(x, y, label, &instrument_14,
+                                    fg, bg, COLOR_PANEL,
+                                    INTERFACE_SIDE_INNER_X,
+                                    INTERFACE_SIDE_INNER_RIGHT,
+                                    frame_y - 1, frame_y + 21);
+}
+
+static void draw_interface_frame(bool masked_header,
+                                 const char *top_label,
+                                 const char *bottom_label)
+{
+    fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
+    if (masked_header) {
+        fill_rect(8, 3, INTERFACE_MAIN_FRAME_WIDTH - 4, 46, COLOR_PANEL);
+        draw_panel_outline(6, 1, INTERFACE_MAIN_FRAME_WIDTH, 50, COLOR_CYAN);
+        fill_rect(8, 54, INTERFACE_MAIN_FRAME_WIDTH - 4, 66, COLOR_PANEL);
+        draw_panel_outline(6, 52, INTERFACE_MAIN_FRAME_WIDTH, 70, COLOR_PURPLE);
+    } else {
+        fill_rect(8, 3, INTERFACE_MAIN_FRAME_WIDTH - 4, 21, COLOR_PANEL);
+        draw_panel_outline(6, 1, INTERFACE_MAIN_FRAME_WIDTH, 25, COLOR_CYAN);
+        fill_rect(8, 28, INTERFACE_MAIN_FRAME_WIDTH - 4, 93, COLOR_PANEL);
+        draw_panel_outline(6, 26, INTERFACE_MAIN_FRAME_WIDTH, 97, COLOR_PURPLE);
+    }
+    fill_rect(8, 126, INTERFACE_MAIN_FRAME_WIDTH - 4, 41, COLOR_PANEL);
+    draw_panel_outline(6, 124, INTERFACE_MAIN_FRAME_WIDTH, 45, COLOR_CYAN);
+
+    fill_rect(INTERFACE_SIDE_INNER_X, 3,
+              INTERFACE_SIDE_INNER_RIGHT - INTERFACE_SIDE_INNER_X,
+              164, COLOR_PANEL);
+    draw_panel_outline(INTERFACE_SIDE_FRAME_X, 1,
+                       INTERFACE_SIDE_FRAME_WIDTH, 168, COLOR_CYAN);
+    draw_interface_side_label(top_label, 4);
+    draw_interface_side_label(bottom_label, 146);
+}
+
+static void draw_serial_header(const app_state_t *s,
+                               const char *title,
+                               uint32_t rate,
+                               uint8_t select,
+                               int panel_right)
 {
     char line[64] = "";
     char value[16];
@@ -1180,11 +1242,11 @@ static void draw_serial_header(const app_state_t *s, const char *title, uint32_t
     }
 
     draw_rich_text_on_panel_clipped(10, 4, line, &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, TFT_WIDTH - 8,
+                                    COLOR_PANEL, 8, panel_right,
                                     3, 24);
 }
 
-static void draw_uart_rx_line(int y, const char *text)
+static void draw_uart_rx_line(int y, const char *text, int panel_right)
 {
     const char *shown = text[0] != '\0' ? text : "-";
     uint16_t fg[64];
@@ -1194,11 +1256,11 @@ static void draw_uart_rx_line(int y, const char *text)
         fg[i] = text[0] != '\0' ? COLOR_WHITE : COLOR_GRAY;
     }
     draw_rich_text_on_panel_clipped(10, y, shown, &instrument_30, fg, bg,
-                                    COLOR_PANEL, 8, TFT_WIDTH - 8,
+                                    COLOR_PANEL, 8, panel_right,
                                     28, 121);
 }
 
-static void draw_small_rx_line(int y, const char *text)
+static void draw_small_rx_line(int y, const char *text, int panel_right)
 {
     const char *shown = text[0] != '\0' ? text : "-";
     uint16_t fg[64];
@@ -1208,7 +1270,7 @@ static void draw_small_rx_line(int y, const char *text)
         fg[i] = text[0] != '\0' ? COLOR_WHITE : COLOR_GRAY;
     }
     draw_rich_text_on_panel_clipped(10, y, shown, &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, TFT_WIDTH - 8,
+                                    COLOR_PANEL, 8, panel_right,
                                     54, 120);
 }
 
@@ -1216,22 +1278,23 @@ static void draw_serial_screen(const app_state_t *s, const char *title, uint32_t
                                uint8_t select, bool draw_frame)
 {
     if (draw_frame) {
-        fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
-        fill_rect(8, 3, TFT_WIDTH - 16, 21, COLOR_PANEL);
-        draw_panel_outline(6, 1, TFT_WIDTH - 12, 25, COLOR_CYAN);
-        fill_rect(8, 28, TFT_WIDTH - 16, 93, COLOR_PANEL);
-        draw_panel_outline(6, 26, TFT_WIDTH - 12, 97, COLOR_PURPLE);
-        fill_rect(8, 126, TFT_WIDTH - 16, 41, COLOR_PANEL);
-        draw_panel_outline(6, 124, TFT_WIDTH - 12, 45, COLOR_CYAN);
+        bool rs485 = strcmp(title, "RS485") == 0;
+        draw_interface_frame(false,
+                             rs485 ? "A" : "RX",
+                             rs485 ? "B" : "TX");
     }
-    draw_serial_header(s, title, rate, select);
-    draw_uart_rx_line(28, s->uart.lines[0]);
-    draw_uart_rx_line(60, s->uart.lines[1]);
-    draw_uart_rx_line(88, s->uart.lines[2]);
-    draw_bottom_actuals(s);
+    draw_serial_header(s, title, rate, select, INTERFACE_MAIN_INNER_RIGHT);
+    draw_uart_rx_line(28, s->uart.lines[0], INTERFACE_MAIN_INNER_RIGHT);
+    draw_uart_rx_line(60, s->uart.lines[1], INTERFACE_MAIN_INNER_RIGHT);
+    draw_uart_rx_line(88, s->uart.lines[2], INTERFACE_MAIN_INNER_RIGHT);
+    draw_bottom_actuals_to(s, INTERFACE_MAIN_INNER_RIGHT);
 }
 
-static void draw_mask_line(int y, const char *mask, uint8_t select, const app_state_t *s)
+static void draw_mask_line(int y,
+                           const char *mask,
+                           uint8_t select,
+                           const app_state_t *s,
+                           int panel_right)
 {
     char line[32] = "";
     uint16_t fg[32];
@@ -1253,19 +1316,14 @@ static void draw_mask_line(int y, const char *mask, uint8_t select, const app_st
     }
 
     draw_rich_text_on_panel_clipped(10, y, line, &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, TFT_WIDTH - 8,
+                                    COLOR_PANEL, 8, panel_right,
                                     3, 49);
 }
 
-static void draw_masked_serial_frame(void)
+static void draw_masked_serial_frame(const char *top_label,
+                                     const char *bottom_label)
 {
-    fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
-    fill_rect(8, 3, TFT_WIDTH - 16, 46, COLOR_PANEL);
-    draw_panel_outline(6, 1, TFT_WIDTH - 12, 50, COLOR_CYAN);
-    fill_rect(8, 54, TFT_WIDTH - 16, 66, COLOR_PANEL);
-    draw_panel_outline(6, 52, TFT_WIDTH - 12, 70, COLOR_PURPLE);
-    fill_rect(8, 126, TFT_WIDTH - 16, 41, COLOR_PANEL);
-    draw_panel_outline(6, 124, TFT_WIDTH - 12, 45, COLOR_CYAN);
+    draw_interface_frame(true, top_label, bottom_label);
 }
 
 static void draw_serial_screen_with_mask(const app_state_t *s,
@@ -1276,16 +1334,16 @@ static void draw_serial_screen_with_mask(const app_state_t *s,
                                          uint8_t mask_select,
                                          bool draw_frame)
 {
-    if (draw_frame) draw_masked_serial_frame();
-    draw_serial_header(s, title, rate, rate_select);
-    draw_mask_line(27, mask, mask_select, s);
-    draw_small_rx_line(54, s->uart.lines[0]);
-    draw_small_rx_line(76, s->uart.lines[1]);
-    draw_small_rx_line(98, s->uart.lines[2]);
-    draw_bottom_actuals(s);
+    if (draw_frame) draw_masked_serial_frame("RX", "TX");
+    draw_serial_header(s, title, rate, rate_select, INTERFACE_MAIN_INNER_RIGHT);
+    draw_mask_line(27, mask, mask_select, s, INTERFACE_MAIN_INNER_RIGHT);
+    draw_small_rx_line(54, s->uart.lines[0], INTERFACE_MAIN_INNER_RIGHT);
+    draw_small_rx_line(76, s->uart.lines[1], INTERFACE_MAIN_INNER_RIGHT);
+    draw_small_rx_line(98, s->uart.lines[2], INTERFACE_MAIN_INNER_RIGHT);
+    draw_bottom_actuals_to(s, INTERFACE_MAIN_INNER_RIGHT);
 }
 
-static void draw_i2c_rx_line(int y, const char *text)
+static void draw_i2c_rx_line_to(int y, const char *text, int panel_right)
 {
     const char *shown = text[0] != '\0' ? text : "-";
     uint16_t fg[64];
@@ -1295,7 +1353,7 @@ static void draw_i2c_rx_line(int y, const char *text)
         fg[i] = text[0] != '\0' ? COLOR_WHITE : COLOR_GRAY;
     }
     draw_rich_text_on_panel_clipped(10, y, shown, &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, TFT_WIDTH - 8,
+                                    COLOR_PANEL, 8, panel_right,
                                     28, 121);
 }
 
@@ -1308,13 +1366,7 @@ static void draw_i2c_sniffer_screen(const app_state_t *s, bool draw_frame)
     size_t mask_start;
 
     if (draw_frame) {
-        fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
-        fill_rect(8, 3, TFT_WIDTH - 16, 21, COLOR_PANEL);
-        draw_panel_outline(6, 1, TFT_WIDTH - 12, 25, COLOR_CYAN);
-        fill_rect(8, 28, TFT_WIDTH - 16, 93, COLOR_PANEL);
-        draw_panel_outline(6, 26, TFT_WIDTH - 12, 97, COLOR_PURPLE);
-        fill_rect(8, 126, TFT_WIDTH - 16, 41, COLOR_PANEL);
-        draw_panel_outline(6, 124, TFT_WIDTH - 12, 45, COLOR_CYAN);
+        draw_interface_frame(false, "SDA", "SCL");
     }
 
     fill_text_colors(fg, bg, 64U);
@@ -1331,14 +1383,14 @@ static void draw_i2c_sniffer_screen(const app_state_t *s, bool draw_frame)
         }
     }
     draw_rich_text_on_panel_clipped(10, 4, line, &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, TFT_WIDTH - 8,
+                                    COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
                                     3, 24);
 
-    draw_i2c_rx_line(30, s->i2c_sniffer.lines[0]);
-    draw_i2c_rx_line(52, s->i2c_sniffer.lines[1]);
-    draw_i2c_rx_line(74, s->i2c_sniffer.lines[2]);
-    draw_i2c_rx_line(96, s->i2c_sniffer.lines[3]);
-    draw_bottom_actuals(s);
+    draw_i2c_rx_line_to(30, s->i2c_sniffer.lines[0], INTERFACE_MAIN_INNER_RIGHT);
+    draw_i2c_rx_line_to(52, s->i2c_sniffer.lines[1], INTERFACE_MAIN_INNER_RIGHT);
+    draw_i2c_rx_line_to(74, s->i2c_sniffer.lines[2], INTERFACE_MAIN_INNER_RIGHT);
+    draw_i2c_rx_line_to(96, s->i2c_sniffer.lines[3], INTERFACE_MAIN_INNER_RIGHT);
+    draw_bottom_actuals_to(s, INTERFACE_MAIN_INNER_RIGHT);
 }
 
 static void draw_i2c_master_screen(const app_state_t *s, bool draw_frame)
@@ -1349,26 +1401,22 @@ static void draw_i2c_master_screen(const app_state_t *s, bool draw_frame)
     size_t pos = 0U;
 
     if (draw_frame) {
-        fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
-        fill_rect(8, 3, TFT_WIDTH - 16, 21, COLOR_PANEL);
-        draw_panel_outline(6, 1, TFT_WIDTH - 12, 25, COLOR_CYAN);
-        fill_rect(8, 28, TFT_WIDTH - 16, 93, COLOR_PANEL);
-        draw_panel_outline(6, 26, TFT_WIDTH - 12, 97, COLOR_PURPLE);
-        fill_rect(8, 126, TFT_WIDTH - 16, 41, COLOR_PANEL);
-        draw_panel_outline(6, 124, TFT_WIDTH - 12, 45, COLOR_CYAN);
+        draw_interface_frame(false, "SDA", "SCL");
     }
 
+    line[0] = '\0';
+    pos = 0U;
     fill_text_colors(fg, bg, 64U);
     append_colored(line, fg, bg, &pos, "I2C MASTER  100K", COLOR_CYAN);
     draw_rich_text_on_panel_clipped(10, 4, line, &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, TFT_WIDTH - 8,
+                                    COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
                                     3, 24);
 
-    draw_i2c_rx_line(30, s->i2c_sniffer.lines[0]);
-    draw_i2c_rx_line(52, s->i2c_sniffer.lines[1]);
-    draw_i2c_rx_line(74, s->i2c_sniffer.lines[2]);
-    draw_i2c_rx_line(96, s->i2c_sniffer.lines[3]);
-    draw_bottom_actuals(s);
+    draw_i2c_rx_line_to(30, s->i2c_sniffer.lines[0], INTERFACE_MAIN_INNER_RIGHT);
+    draw_i2c_rx_line_to(52, s->i2c_sniffer.lines[1], INTERFACE_MAIN_INNER_RIGHT);
+    draw_i2c_rx_line_to(74, s->i2c_sniffer.lines[2], INTERFACE_MAIN_INNER_RIGHT);
+    draw_i2c_rx_line_to(96, s->i2c_sniffer.lines[3], INTERFACE_MAIN_INNER_RIGHT);
+    draw_bottom_actuals_to(s, INTERFACE_MAIN_INNER_RIGHT);
 }
 
 static void draw_can_screen(const app_state_t *s, bool draw_frame)
@@ -1380,7 +1428,7 @@ static void draw_can_screen(const app_state_t *s, bool draw_frame)
     size_t pos = 0U;
     size_t value_start;
 
-    if (draw_frame) draw_masked_serial_frame();
+    if (draw_frame) draw_masked_serial_frame("H", "L");
 
     snprintf(value, sizeof(value), "%lu", (unsigned long)(s->control.can_bitrate / 1000U));
     fill_text_colors(fg, bg, 64U);
@@ -1392,22 +1440,23 @@ static void draw_can_screen(const app_state_t *s, bool draw_frame)
         mark_range(fg, bg, value_start, strlen(value), COLOR_BLACK, COLOR_YELLOW);
     }
     draw_rich_text_on_panel_clipped(10, 4, line, &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, TFT_WIDTH - 8,
+                                    COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
                                     3, 24);
-    draw_mask_line(27, s->control.can_mask, CONTROL_SELECT_CAN_MASK, s);
+    draw_mask_line(27, s->control.can_mask, CONTROL_SELECT_CAN_MASK, s,
+                   INTERFACE_MAIN_INNER_RIGHT);
 
     fill_text_colors(fg, bg, 64U);
     for (size_t i = 0U; i < strlen("ID: ---"); ++i) fg[i] = COLOR_WHITE;
     draw_rich_text_on_panel_clipped(10, 65, "ID: ---", &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, TFT_WIDTH - 8,
+                                    COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
                                     54, 120);
     fill_text_colors(fg, bg, 64U);
     for (size_t i = 0U; i < strlen("DATA: --"); ++i) fg[i] = COLOR_WHITE;
     draw_rich_text_on_panel_clipped(10, 91, "DATA: --", &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, TFT_WIDTH - 8,
+                                    COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
                                     54, 120);
 
-    draw_bottom_actuals(s);
+    draw_bottom_actuals_to(s, INTERFACE_MAIN_INNER_RIGHT);
 }
 
 static void draw_setting_line(int y,
@@ -1479,11 +1528,24 @@ static void draw_setting_screen(const app_state_t *s, bool draw_frame)
     draw_setting_line(139, "Volume", value, CONTROL_SELECT_VOLUME, s, 137, 167);
 }
 
-static void draw_reserved_screen(const app_state_t *s, const char *title)
+static void draw_1wire_screen(const app_state_t *s, bool draw_frame)
 {
-    draw_text(8, 4, title, &instrument_18, COLOR_CYAN);
-    draw_text(8, 58, "RESERVED", &instrument_30, COLOR_GRAY);
-    draw_bottom_actuals(s);
+    uint16_t fg[16];
+    uint16_t bg[16];
+    if (draw_frame) draw_interface_frame(false, "DQ", "");
+
+    fill_text_colors(fg, bg, 16U);
+    for (size_t i = 0U; i < strlen("1WIRE"); ++i) fg[i] = COLOR_CYAN;
+    draw_rich_text_on_panel_clipped(10, 4, "1WIRE", &instrument_18, fg, bg,
+                                    COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
+                                    3, 24);
+
+    fill_text_colors(fg, bg, 16U);
+    for (size_t i = 0U; i < strlen("RESERVED"); ++i) fg[i] = COLOR_GRAY;
+    draw_rich_text_on_panel_clipped(10, 58, "RESERVED", &instrument_30, fg, bg,
+                                    COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
+                                    28, 121);
+    draw_bottom_actuals_to(s, INTERFACE_MAIN_INNER_RIGHT);
 }
 
 static const char *mode_menu_name(app_mode_t mode)
@@ -2022,7 +2084,8 @@ void display_render(const app_state_t *s)
                     serial_screen_initialized = true;
                     break;
                 case APP_MODE_1WIRE:
-                    draw_reserved_screen(s, "1WIRE");
+                    draw_1wire_screen(s, !serial_screen_initialized);
+                    serial_screen_initialized = true;
                     break;
                 case APP_MODE_RS485:
                     draw_serial_screen(s, "RS485", s->control.rs485_baud,
