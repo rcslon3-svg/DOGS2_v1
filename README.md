@@ -1,5 +1,11 @@
 # DOGS²
 
+<p align="center">
+  <img src="assets/photos/dogs2-working-prototype-front.png"
+       alt="DOGS² v1 working engineering prototype"
+       width="900">
+</p>
+
 **DOGS² (Dual Output Generator Supply Station)** is an open-source, standalone
 board bring-up station. It combines two programmable power outputs, current and
 voltage monitoring, a signal generator, and common embedded-interface tools in
@@ -39,6 +45,30 @@ firmware development, documentation, enclosure work, and preparation for
 external beta testing are ongoing.
 
 Project page: [dogs2.smartmoto.asia](https://dogs2.smartmoto.asia)
+
+## Working hardware
+
+<table>
+  <tr>
+    <td width="33%">
+      <img src="assets/photos/dogs2-working-prototype-top.png"
+           alt="DOGS² v1 engineering prototype viewed from above">
+    </td>
+    <td width="33%">
+      <img src="assets/photos/dogs2-signal-generator.jpg"
+           alt="DOGS² signal generator mode">
+    </td>
+    <td width="33%">
+      <img src="assets/photos/dogs2-rs485-test.png"
+           alt="DOGS² during an RS485 test">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">v1 engineering prototype</td>
+    <td align="center">Signal generator</td>
+    <td align="center">RS485 test</td>
+  </tr>
+</table>
 
 ## Licensing
 
