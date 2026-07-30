@@ -1421,14 +1421,25 @@ static void draw_i2c_master_screen(const app_state_t *s, bool draw_frame)
 
 static void draw_can_screen(const app_state_t *s, bool draw_frame)
 {
+    static char previous_header[64];
+    static char previous_status[64];
+    static char previous_rx[3][I2C_DISPLAY_CHARS + 1U];
     char line[64] = "";
     char value[16];
     uint16_t fg[64];
     uint16_t bg[64];
     size_t pos = 0U;
     size_t value_start;
+    size_t mask_start;
+    const char *tx_text = "---";
+    uint16_t tx_color = COLOR_GRAY;
 
-    if (draw_frame) draw_masked_serial_frame("H", "L");
+    if (draw_frame) {
+        draw_masked_serial_frame("H", "L");
+        previous_header[0] = '\0';
+        previous_status[0] = '\0';
+        memset(previous_rx, 0, sizeof(previous_rx));
+    }
 
     snprintf(value, sizeof(value), "%lu", (unsigned long)(s->control.can_bitrate / 1000U));
     fill_text_colors(fg, bg, 64U);
@@ -1439,22 +1450,52 @@ static void draw_can_screen(const app_state_t *s, bool draw_frame)
     if (s->control.selected_value == CONTROL_SELECT_CAN_BITRATE) {
         mark_range(fg, bg, value_start, strlen(value), COLOR_BLACK, COLOR_YELLOW);
     }
-    draw_rich_text_on_panel_clipped(10, 4, line, &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
-                                    3, 24);
-    draw_mask_line(27, s->control.can_mask, CONTROL_SELECT_CAN_MASK, s,
-                   INTERFACE_MAIN_INNER_RIGHT);
+    if (strcmp(previous_header, line) != 0) {
+        fill_rect(8, 3, INTERFACE_MAIN_FRAME_WIDTH - 4, 21, COLOR_PANEL);
+        draw_rich_text_on_panel_clipped(10, 4, line, &instrument_18, fg, bg,
+                                        COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
+                                        3, 24);
+        snprintf(previous_header, sizeof(previous_header), "%s", line);
+    }
 
+    line[0] = '\0';
+    pos = 0U;
     fill_text_colors(fg, bg, 64U);
-    for (size_t i = 0U; i < strlen("ID: ---"); ++i) fg[i] = COLOR_WHITE;
-    draw_rich_text_on_panel_clipped(10, 65, "ID: ---", &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
-                                    54, 120);
-    fill_text_colors(fg, bg, 64U);
-    for (size_t i = 0U; i < strlen("DATA: --"); ++i) fg[i] = COLOR_WHITE;
-    draw_rich_text_on_panel_clipped(10, 91, "DATA: --", &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
-                                    54, 120);
+    append_colored(line, fg, bg, &pos, "MASK ", COLOR_LABEL);
+    mask_start = pos;
+    append_colored(line, fg, bg, &pos, s->control.can_mask, COLOR_YELLOW);
+    append_colored(line, fg, bg, &pos, " TX ", COLOR_LABEL);
+    switch (s->can.tx_result) {
+        case 1U: tx_text = "OK"; tx_color = COLOR_GREEN; break;
+        case 2U: tx_text = "BUSY"; tx_color = COLOR_YELLOW; break;
+        case 3U: tx_text = "ERR"; tx_color = COLOR_RED; break;
+        default: break;
+    }
+    append_colored(line, fg, bg, &pos, tx_text, tx_color);
+    if (s->control.selected_value == CONTROL_SELECT_CAN_MASK) {
+        if (s->control.selected_digit == CONTROL_DIGIT_WHOLE) {
+            mark_range(fg, bg, mask_start, strlen(s->control.can_mask),
+                       COLOR_BLACK, COLOR_YELLOW);
+        } else if (s->control.selected_digit < strlen(s->control.can_mask)) {
+            mark_range(fg, bg, mask_start + s->control.selected_digit, 1U,
+                       COLOR_BLACK, COLOR_YELLOW);
+        }
+    }
+    if (strcmp(previous_status, line) != 0) {
+        fill_rect(8, 27, INTERFACE_MAIN_FRAME_WIDTH - 4, 21, COLOR_PANEL);
+        draw_rich_text_on_panel_clipped(10, 27, line, &instrument_18, fg, bg,
+                                        COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
+                                        25, 51);
+        snprintf(previous_status, sizeof(previous_status), "%s", line);
+    }
+
+    const int rx_y[3] = {54, 76, 98};
+    for (size_t i = 0U; i < 3U; ++i) {
+        if (strcmp(previous_rx[i], s->can.lines[i]) == 0) continue;
+        fill_rect(8, rx_y[i], INTERFACE_MAIN_FRAME_WIDTH - 4, 20, COLOR_PANEL);
+        draw_small_rx_line(rx_y[i], s->can.lines[i], INTERFACE_MAIN_INNER_RIGHT);
+        snprintf(previous_rx[i], sizeof(previous_rx[i]), "%s", s->can.lines[i]);
+    }
 
     draw_bottom_actuals_to(s, INTERFACE_MAIN_INNER_RIGHT);
 }
@@ -1961,7 +2002,7 @@ void display_render(const app_state_t *s)
     static char previous_ch_a[64] = "";
     static char previous_ch_b[64] = "";
     static char previous_limits[64] = "";
-    static char previous_mode_screen[512] = "";
+    static char previous_mode_screen[768] = "";
     static app_mode_t previous_mode = APP_MODE_COUNT;
     static bool previous_menu_open;
     static uint8_t previous_menu_index = 0xFFU;
@@ -1974,7 +2015,7 @@ void display_render(const app_state_t *s)
     static uint32_t previous_probe_span_mv = UINT32_MAX;
     static uint32_t displayed_probe_tenths = UINT32_MAX;
     char line[64];
-    char mode_line[512];
+    char mode_line[768];
     uint8_t edit_blink_phase = (uint8_t)((esp_timer_get_time() / 500000LL) & 1LL);
 
     if (previous_menu_open != s->control.menu_open) {
@@ -2025,43 +2066,50 @@ void display_render(const app_state_t *s)
         snprintf(previous_ch_b, sizeof(previous_ch_b), "%s", "");
         snprintf(previous_limits, sizeof(previous_limits), "%s", "");
 
+        if (s->control.mode == APP_MODE_CAN) {
+            draw_can_screen(s, !serial_screen_initialized);
+            serial_screen_initialized = true;
+            display_set_rgb(s->analog.logic_state);
+            return;
+        }
+
         snprintf(mode_line, sizeof(mode_line), "M%u S%u D%u F%lu P%u O%u U%lu L%lu R%lu C%lu LM%s CM%s IM%s OC%u OH%u OP%u V%u T%s|%s|%s UE%lu I%s|%s|%s|%s IP%lu IE%lu A%u%lu%ld B%u%lu%ld",
-                 (unsigned)s->control.mode,
-                 (unsigned)s->control.selected_value,
-                 (unsigned)s->control.selected_digit,
-                 (unsigned long)s->control.generator_freq_hz,
-                 (unsigned)s->control.generator_duty_percent,
-                 s->control.generator_on ? 1U : 0U,
-                 (unsigned long)s->control.uart_baud,
-                 (unsigned long)s->control.lin_baud,
-                 (unsigned long)s->control.rs485_baud,
-                 (unsigned long)s->control.can_bitrate,
-                 s->control.lin_mask,
-                 s->control.can_mask,
-                 s->control.i2c_mask,
-                 s->control.overcurrent_cc ? 1U : 0U,
-                 (unsigned)s->control.overheat_c,
-                 (unsigned)s->control.overpower_w,
-                 (unsigned)s->control.volume_percent,
-                 (s->control.mode == APP_MODE_UART || s->control.mode == APP_MODE_LIN ||
-                  s->control.mode == APP_MODE_RS485) ? s->uart.lines[0] : "",
-                 (s->control.mode == APP_MODE_UART || s->control.mode == APP_MODE_LIN ||
-                  s->control.mode == APP_MODE_RS485) ? s->uart.lines[1] : "",
-                 (s->control.mode == APP_MODE_UART || s->control.mode == APP_MODE_LIN ||
-                  s->control.mode == APP_MODE_RS485) ? s->uart.lines[2] : "",
-                 (unsigned long)s->uart.errors,
-                 s->control.mode == APP_MODE_I2C ? s->i2c_sniffer.lines[0] : "",
-                 s->control.mode == APP_MODE_I2C ? s->i2c_sniffer.lines[1] : "",
-                 s->control.mode == APP_MODE_I2C ? s->i2c_sniffer.lines[2] : "",
-                 s->control.mode == APP_MODE_I2C ? s->i2c_sniffer.lines[3] : "",
-                 (unsigned long)s->i2c_sniffer.packets,
-                 (unsigned long)s->i2c_sniffer.errors,
-                 s->ina238.channel[0].valid ? 1U : 0U,
-                 (unsigned long)s->ina238.channel[0].bus_mv,
-                 (long)s->ina238.channel[0].shunt_uv,
-                 s->ina238.channel[1].valid ? 1U : 0U,
-                 (unsigned long)s->ina238.channel[1].bus_mv,
-                 (long)s->ina238.channel[1].shunt_uv);
+                     (unsigned)s->control.mode,
+                     (unsigned)s->control.selected_value,
+                     (unsigned)s->control.selected_digit,
+                     (unsigned long)s->control.generator_freq_hz,
+                     (unsigned)s->control.generator_duty_percent,
+                     s->control.generator_on ? 1U : 0U,
+                     (unsigned long)s->control.uart_baud,
+                     (unsigned long)s->control.lin_baud,
+                     (unsigned long)s->control.rs485_baud,
+                     (unsigned long)s->control.can_bitrate,
+                     s->control.lin_mask,
+                     s->control.can_mask,
+                     s->control.i2c_mask,
+                     s->control.overcurrent_cc ? 1U : 0U,
+                     (unsigned)s->control.overheat_c,
+                     (unsigned)s->control.overpower_w,
+                     (unsigned)s->control.volume_percent,
+                     (s->control.mode == APP_MODE_UART || s->control.mode == APP_MODE_LIN ||
+                      s->control.mode == APP_MODE_RS485) ? s->uart.lines[0] : "",
+                     (s->control.mode == APP_MODE_UART || s->control.mode == APP_MODE_LIN ||
+                      s->control.mode == APP_MODE_RS485) ? s->uart.lines[1] : "",
+                     (s->control.mode == APP_MODE_UART || s->control.mode == APP_MODE_LIN ||
+                      s->control.mode == APP_MODE_RS485) ? s->uart.lines[2] : "",
+                     (unsigned long)s->uart.errors,
+                     s->control.mode == APP_MODE_I2C ? s->i2c_sniffer.lines[0] : "",
+                     s->control.mode == APP_MODE_I2C ? s->i2c_sniffer.lines[1] : "",
+                     s->control.mode == APP_MODE_I2C ? s->i2c_sniffer.lines[2] : "",
+                     s->control.mode == APP_MODE_I2C ? s->i2c_sniffer.lines[3] : "",
+                     (unsigned long)s->i2c_sniffer.packets,
+                     (unsigned long)s->i2c_sniffer.errors,
+                     s->ina238.channel[0].valid ? 1U : 0U,
+                     (unsigned long)s->ina238.channel[0].bus_mv,
+                     (long)s->ina238.channel[0].shunt_uv,
+                     s->ina238.channel[1].valid ? 1U : 0U,
+                     (unsigned long)s->ina238.channel[1].bus_mv,
+                     (long)s->ina238.channel[1].shunt_uv);
         if (strcmp(previous_mode_screen, mode_line) != 0) {
             switch (s->control.mode) {
                 case APP_MODE_GENERATOR:

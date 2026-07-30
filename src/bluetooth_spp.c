@@ -1,5 +1,6 @@
 #include "bluetooth_spp.h"
 
+#include <stdio.h>
 #include <string.h>
 #include "esp_bt.h"
 #include "esp_bt_device.h"
@@ -8,10 +9,12 @@
 #include "esp_gap_bt_api.h"
 #include "esp_spp_api.h"
 #include "freertos/FreeRTOS.h"
+#include "nvs.h"
 #include "probe_config.h"
 
 #define BLUETOOTH_SPP_TX_BUFFER_SIZE 512U
 #define BLUETOOTH_SPP_TX_QUEUE_DEPTH 16U
+#define BLUETOOTH_DEFAULT_BOARD_NUMBER 1U
 
 static uint32_t s_client_handle;
 static bool s_write_busy;
@@ -23,6 +26,26 @@ static uint8_t s_tx_queue_tail;
 static uint8_t s_tx_queue_count;
 static portMUX_TYPE s_tx_lock = portMUX_INITIALIZER_UNLOCKED;
 static bluetooth_command_cb_t s_command_callback;
+static char s_device_name[16] = BLUETOOTH_DEVICE_NAME;
+static uint16_t s_board_number = BLUETOOTH_DEFAULT_BOARD_NUMBER;
+
+static void load_device_name(void)
+{
+    uint16_t board_number = BLUETOOTH_DEFAULT_BOARD_NUMBER;
+    nvs_handle_t nvs;
+    if (nvs_open("device", NVS_READWRITE, &nvs) == ESP_OK) {
+        uint16_t stored = 0U;
+        if (nvs_get_u16(nvs, "board_no", &stored) == ESP_OK && stored > 0U && stored <= 999U) {
+            board_number = stored;
+        } else {
+            (void)nvs_set_u16(nvs, "board_no", board_number);
+            (void)nvs_commit(nvs);
+        }
+        nvs_close(nvs);
+    }
+    s_board_number = board_number;
+    (void)snprintf(s_device_name, sizeof(s_device_name), "DOGS2_A%03u", board_number);
+}
 
 static void tx_queue_clear(void)
 {
@@ -78,9 +101,9 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *parameter
 {
     switch (event) {
         case ESP_SPP_INIT_EVT:
-            esp_bt_gap_set_device_name(BLUETOOTH_DEVICE_NAME);
+            esp_bt_gap_set_device_name(s_device_name);
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-            esp_spp_start_srv(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_SLAVE, 0, BLUETOOTH_DEVICE_NAME);
+            esp_spp_start_srv(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_SLAVE, 0, s_device_name);
             break;
         case ESP_SPP_SRV_OPEN_EVT:
             s_client_handle = parameter->srv_open.handle;
@@ -115,6 +138,7 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *parameter
 esp_err_t bluetooth_spp_init(bluetooth_command_cb_t callback)
 {
     s_command_callback = callback;
+    load_device_name();
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
     esp_bt_controller_config_t config = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_RETURN_ON_ERROR(esp_bt_controller_init(&config), "bt", "controller init");
@@ -128,6 +152,16 @@ esp_err_t bluetooth_spp_init(bluetooth_command_cb_t callback)
         .tx_buffer_size = 0U
     };
     return esp_spp_enhanced_init(&spp_config);
+}
+
+const char *bluetooth_spp_device_name(void)
+{
+    return s_device_name;
+}
+
+uint16_t bluetooth_spp_board_number(void)
+{
+    return s_board_number;
 }
 
 /* bluetooth_spp_connected

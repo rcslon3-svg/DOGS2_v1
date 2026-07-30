@@ -106,6 +106,18 @@ typedef struct {
 } app_i2c_sniffer_state_t;
 
 typedef struct {
+    char text[I2C_DISPLAY_CHARS + 1U];
+    char lines[3][I2C_DISPLAY_CHARS + 1U];
+    uint32_t packets;
+    uint32_t errors;
+    uint32_t tx_error_counter;
+    uint32_t tx_queue_msgs;
+    uint8_t tx_result;
+    bool last_tx_ok;
+    bool bus_off;
+} app_can_state_t;
+
+typedef struct {
     bool valid;
     bool wide_range;
     bool saturated;
@@ -208,6 +220,7 @@ typedef struct {
     app_timing_state_t timing;
     app_uart_state_t uart;
     app_i2c_sniffer_state_t i2c_sniffer;
+    app_can_state_t can;
     app_ina238_state_t ina238;
     app_tps55289_state_t tps55289;
     app_lm51772_state_t lm51772;

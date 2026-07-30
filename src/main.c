@@ -2,6 +2,7 @@
 #include <string.h>
 #include "bluetooth_spp.h"
 #include "buzzer.h"
+#include "can_probe.h"
 #include "channelA.h"
 #include "channelB.h"
 #include "control.h"
@@ -159,7 +160,6 @@ static esp_err_t board_power_init(void)
              (int)BOARD_PERIPHERAL_POWER_GPIO,
              inactive_level);
 #if BOARD_PERIPHERAL_POWER_AUTO_ENABLE
-    vTaskDelay(pdMS_TO_TICKS(1000));
     ESP_LOGI(TAG, "peripheral power gpio %d active level %d",
              (int)BOARD_PERIPHERAL_POWER_GPIO,
              BOARD_PERIPHERAL_POWER_ACTIVE_LEVEL);
@@ -184,6 +184,7 @@ static void enqueue_command(char command)
 
 static void bluetooth_command(char command)
 {
+    if (can_probe_input_char(command)) return;
     if (i2c_master_terminal_input_char(command)) return;
 
 #if UART_PROBE_ENABLED
@@ -394,6 +395,8 @@ void app_main(void)
 #endif
     ESP_LOGI(TAG, "i2c_master_terminal_init");
     ESP_ERROR_CHECK(i2c_master_terminal_init());
+    ESP_LOGI(TAG, "can_probe_init");
+    ESP_ERROR_CHECK(can_probe_init());
     ESP_LOGI(TAG, "buzzer_init begin");
     ESP_ERROR_CHECK(buzzer_init());
     ESP_LOGI(TAG, "buzzer_init end");
@@ -415,7 +418,7 @@ void app_main(void)
 
     esp_err_t bt_result = bluetooth_spp_init(bluetooth_command);
     if (bt_result != ESP_OK) ESP_LOGE(TAG, "Bluetooth init: %s", esp_err_to_name(bt_result));
-    else ESP_LOGI(TAG, "Bluetooth device: %s", BLUETOOTH_DEVICE_NAME);
+    else ESP_LOGI(TAG, "Bluetooth device: %s", bluetooth_spp_device_name());
 
     int64_t last_ui_us = 0;
     display_black();
@@ -476,6 +479,11 @@ void app_main(void)
         i2c_master_terminal_configure(s_state.control.mode);
 #endif
         i2c_master_terminal_update(&s_state);
+        can_probe_configure(s_state.control.mode,
+                            s_state.control.can_bitrate,
+                            s_state.control.can_mask_value,
+                            s_state.control.can_mask_care);
+        can_probe_update(&s_state, now);
         control_persistence_update(now);
         buzzer_update();
         power_telemetry_update(&s_state, now);

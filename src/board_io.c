@@ -140,19 +140,13 @@ static uint8_t ui_output_for_state(const app_state_t *state)
     return output;
 }
 
-esp_err_t board_io_init(void)
+static esp_err_t init_ctrl_expander(void)
 {
-    if (s_ctrl_expander == NULL) {
-        ESP_RETURN_ON_ERROR(add_expander(IO_EXPANDER_CTRL_ADDRESS, &s_ctrl_expander),
-                            TAG, "add ctrl expander");
-    }
-    if (s_ui_expander == NULL) {
-        ESP_RETURN_ON_ERROR(add_expander(IO_EXPANDER_UI_ADDRESS, &s_ui_expander),
-                            TAG, "add ui expander");
-    }
+    if (s_ctrl_expander != NULL) return ESP_OK;
+    ESP_RETURN_ON_ERROR(add_expander(IO_EXPANDER_CTRL_ADDRESS, &s_ctrl_expander),
+                        TAG, "add ctrl expander");
 
     s_ctrl_output_valid = false;
-    s_ui_output_valid = false;
     s_rs485_tx_enabled = false;
     s_test_100hz_level = false;
     s_last_mode = APP_MODE_POWER_SUPPLY;
@@ -167,6 +161,16 @@ esp_err_t board_io_init(void)
                         TAG, "ctrl config");
     s_last_ctrl_output = BIT_U8(CTRL_EXP_CAN_RS_BIT);
     s_ctrl_output_valid = true;
+    return ESP_OK;
+}
+
+static esp_err_t init_ui_expander(void)
+{
+    if (s_ui_expander != NULL) return ESP_OK;
+    ESP_RETURN_ON_ERROR(add_expander(IO_EXPANDER_UI_ADDRESS, &s_ui_expander),
+                        TAG, "add ui expander");
+
+    s_ui_output_valid = false;
 
     ESP_RETURN_ON_ERROR(write_reg(s_ui_expander, PCA9557_REG_OUTPUT, 0x00U),
                         TAG, "ui safe output");
@@ -182,6 +186,17 @@ esp_err_t board_io_init(void)
                         TAG, "ui config");
     s_last_ui_output = 0x00U;
     s_ui_output_valid = true;
+
+    return ESP_OK;
+}
+
+esp_err_t board_io_init(void)
+{
+    esp_err_t ctrl = init_ctrl_expander();
+    if (ctrl != ESP_OK) ESP_LOGW(TAG, "ctrl expander unavailable: %s", esp_err_to_name(ctrl));
+
+    esp_err_t ui = init_ui_expander();
+    if (ui != ESP_OK) ESP_LOGW(TAG, "ui expander unavailable: %s", esp_err_to_name(ui));
 
     return ESP_OK;
 }
@@ -220,9 +235,8 @@ void board_io_update(const app_state_t *state)
 {
     if (state == NULL) return;
 
-    if (s_ctrl_expander == NULL || s_ui_expander == NULL) {
-        if (board_io_init() != ESP_OK) return;
-    }
+    if (s_ctrl_expander == NULL) (void)init_ctrl_expander();
+    if (s_ui_expander == NULL) (void)init_ui_expander();
 
     s_last_mode = state->control.mode;
     if (s_last_mode != APP_MODE_RS485) {
@@ -232,6 +246,7 @@ void board_io_update(const app_state_t *state)
     (void)write_ui_output(ui_output_for_state(state));
 
     uint8_t input = 0xFFU;
+    if (s_ui_expander == NULL) return;
     esp_err_t err = read_reg(s_ui_expander, PCA9557_REG_INPUT, &input);
     if (err == ESP_OK) {
         s_last_ui_input = input;
@@ -250,9 +265,7 @@ esp_err_t board_io_toggle_test_100hz(const app_state_t *state)
 {
     if (state == NULL) return ESP_ERR_INVALID_ARG;
 
-    if (s_ctrl_expander == NULL || s_ui_expander == NULL) {
-        ESP_RETURN_ON_ERROR(board_io_init(), TAG, "init for test toggle");
-    }
+    if (s_ctrl_expander == NULL) ESP_RETURN_ON_ERROR(init_ctrl_expander(), TAG, "init ctrl for test toggle");
 
     s_last_mode = state->control.mode;
     if (s_last_mode != APP_MODE_RS485) {
@@ -266,9 +279,7 @@ esp_err_t board_io_set_test_100hz(const app_state_t *state, bool high)
 {
     if (state == NULL) return ESP_ERR_INVALID_ARG;
 
-    if (s_ctrl_expander == NULL || s_ui_expander == NULL) {
-        ESP_RETURN_ON_ERROR(board_io_init(), TAG, "init for test set");
-    }
+    if (s_ctrl_expander == NULL) ESP_RETURN_ON_ERROR(init_ctrl_expander(), TAG, "init ctrl for test set");
 
     s_last_mode = state->control.mode;
     if (s_last_mode != APP_MODE_RS485) {
@@ -297,8 +308,8 @@ void board_io_set_rs485_tx_enabled(bool enabled)
     s_rs485_tx_enabled = enabled;
     if (s_last_mode != APP_MODE_RS485) return;
 
-    if (s_ctrl_expander == NULL || s_ui_expander == NULL) {
-        if (board_io_init() != ESP_OK) return;
+    if (s_ctrl_expander == NULL) {
+        if (init_ctrl_expander() != ESP_OK) return;
     }
 
     (void)write_ctrl_output(ctrl_output_for_mode(APP_MODE_RS485));
