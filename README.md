@@ -1,35 +1,47 @@
-# Logic_v2
+# DOGS²
 
-ESP32-WROOM logic probe / dual PSU firmware forked from Logic_v1.
+**DOGS² (Dual Output Generator Supply Station)** is an open-source, standalone
+board bring-up station. It combines two programmable power outputs, current and
+voltage monitoring, a signal generator, and common embedded-interface tools in
+one compact instrument.
 
-Documentation:
-- [I2C Master Terminal](I2C_MASTER_TERMINAL.md)
-- [Measurement modes](MEASUREMENT_MODES.md)
-- [Analog channel](ANALOG_CHANNEL.md)
+This repository documents the current **v1 engineering samples**. The hardware
+works and the firmware is under active development and tuning; published limits
+and accuracy figures should therefore be treated as engineering-sample data,
+not final product specifications.
 
-Pins:
-- GPIO35: ADC input
-- GPIO27: weak continuous test square wave through 300 kOhm
-- GPIO22: timing input and UART RX
-- GPIO26: diagnostic output only, owned by io26_diag.c
-- ST7789 1.9" 170x320 SPI TFT:
-  - SCL/SCLK: GPIO15
-  - SDA/MOSI: GPIO2
-  - RES: GPIO4
-  - DC: GPIO16
-  - CS: GPIO17
-  - BLK: GPIO5
-- Encoder moved off GPIO5 because BLK uses it:
-  - A: GPIO13
-  - B: GPIO12
-  - encoder button: GPIO14
-  - external UI: GPIO18, same action as encoder button
-  - all inputs use ESP32 internal pull-ups
-  - one button advances through values and editable digits
+## Repository structure
 
-Commands:
-- h: help
-- r: IO26 High-Z
-- v<mV>: DAC output on IO26
-- f<freq>-<duty>: test square wave on IO26
-- u115 / u9: UART TX test on IO26
+| Directory | Contents |
+|---|---|
+| [`hardware/`](hardware/) | Schematics, block diagram, editable design archive, PCB manufacturing files, BOMs, renders, and known v1 issues |
+| [`mechanical/`](mechanical/) | Mechanical-design status and future enclosure files |
+| [`software/`](software/) | Current ESP32 firmware, build configuration, tools, and software documentation |
+
+## Current capabilities
+
+- two independently controlled power channels with CV/CC operation;
+- voltage and current monitoring;
+- standalone TFT display, encoder, and front-panel controls;
+- square-wave generator;
+- UART and RS485 terminal modes;
+- CAN receive, filtering, and transmission;
+- I²C sniffer and I²C master terminal;
+- analog probe and frequency input;
+- Bluetooth SPP command and telemetry connection.
+
+The 1-Wire decoder and full LIN protocol support are still in development.
+
+## Project status
+
+Five v1 engineering samples have been assembled. Hardware characterization,
+firmware development, documentation, enclosure work, and preparation for
+external beta testing are ongoing.
+
+Project page: [dogs2.smartmoto.asia](https://dogs2.smartmoto.asia)
+
+## Licensing
+
+The v1 hardware design is licensed under
+[CERN-OHL-W-2.0](hardware/LICENSE). Firmware and other repository content will
+receive their own explicit licences before a public release.
