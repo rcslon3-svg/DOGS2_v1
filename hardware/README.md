@@ -34,6 +34,20 @@ connections, and digital-interface drivers.
     <td align="center">Power board render</td>
     <td align="center">Control panel render</td>
   </tr>
+  <tr>
+    <td width="50%">
+      <img src="renders/DOGS2_v1_power_board_3d_bottom.png"
+           alt="DOGS² v1 power board bottom render">
+    </td>
+    <td width="50%">
+      <img src="renders/DOGS2_v1_control_panel_3d_rear.png"
+           alt="DOGS² v1 control panel rear render">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">Power board — bottom</td>
+    <td align="center">Control panel — rear</td>
+  </tr>
 </table>
 
 ## Directory contents

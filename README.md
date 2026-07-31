@@ -70,6 +70,23 @@ Project page: [dogs2.smartmoto.asia](https://dogs2.smartmoto.asia)
   </tr>
 </table>
 
+<table>
+  <tr>
+    <td width="50%">
+      <img src="assets/photos/dogs2-assembled-bottom.png"
+           alt="DOGS² v1 assembled prototype viewed from below">
+    </td>
+    <td width="50%">
+      <img src="assets/photos/dogs2-power-board-top-angle-closeup.jpg"
+           alt="DOGS² v1 power board top-angle close-up">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">Assembled prototype — bottom view</td>
+    <td align="center">Power board — top-angle close-up</td>
+  </tr>
+</table>
+
 ## Documentation map
 
 - Hardware overview: [`hardware/README.md`](hardware/README.md)
