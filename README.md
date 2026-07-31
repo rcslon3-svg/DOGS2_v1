@@ -20,9 +20,9 @@ not final product specifications.
 
 | Directory | Contents |
 |---|---|
-| [`hardware/`](hardware/) | Schematics, block diagram, editable design archive, PCB manufacturing files, BOMs, renders, and known v1 issues |
+| [`hardware/`](hardware/) | Schematics, block diagram, editable design archive, PCB manufacturing files, BOMs, renders, and hardware known issues |
 | [`mechanical/`](mechanical/) | Mechanical-design status and future enclosure files |
-| [`software/`](software/) | Current ESP32 firmware, build configuration, tools, and software documentation |
+| [`software/`](software/) | Current ESP32 firmware, build configuration, tools, software documentation, and software known issues |
 
 ## Current capabilities
 
@@ -32,7 +32,7 @@ not final product specifications.
 - square-wave generator;
 - UART and RS485 terminal modes;
 - CAN receive, filtering, and transmission;
-- I²C sniffer and I²C master terminal;
+- I2C sniffer and I2C master terminal;
 - analog probe and frequency input;
 - Bluetooth SPP command and telemetry connection.
 
@@ -69,6 +69,12 @@ Project page: [dogs2.smartmoto.asia](https://dogs2.smartmoto.asia)
     <td align="center">RS485 test</td>
   </tr>
 </table>
+
+## Documentation map
+
+- Hardware overview: [`hardware/README.md`](hardware/README.md)
+- Hardware schematics: [`hardware/schematic/`](hardware/schematic/)
+- Firmware overview: [`software/README.md`](software/README.md)
 
 ## Licensing
 

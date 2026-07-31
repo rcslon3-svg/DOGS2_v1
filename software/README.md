@@ -14,8 +14,8 @@ sample. It targets an ESP32-WROOM module and uses ESP-IDF through PlatformIO.
 | 1-Wire | UI placeholder; decoder is in development |
 | RS485 | Configurable half-duplex terminal |
 | CAN | Configurable bitrate and filter, receive display, Bluetooth reporting, and frame transmission |
-| I²C Sniffer | Passive capture with address filter |
-| I²C Master | 100 kHz scan, register/raw read, and register/raw write commands |
+| I2C Sniffer | Passive capture with address filter |
+| I2C Master | 100 kHz scan, register/raw read, and register/raw write commands |
 | Settings | Protection thresholds and user settings |
 
 Bluetooth SPP exposes commands and telemetry without consuming another USB
