@@ -32,6 +32,12 @@ not final product specifications.
 
 ## Current capabilities
 
+<p align="center">
+  <img src="assets/photos/pinout.jpg"
+       alt="DOGS² v1 connect and control"
+       width="900">
+</p>
+
 - two independently controlled power channels with CV/CC operation;
 - voltage and current monitoring;
 - standalone TFT display, encoder, and front-panel controls;
