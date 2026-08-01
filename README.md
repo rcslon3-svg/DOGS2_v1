@@ -1,8 +1,8 @@
 # DOGS²
 
 <p align="center">
-  <img src="assets/photos/all_you_need.png"
-       alt="DOGS² v1 working engineering prototype"
+  <img src="assets/photos/all_you_need.jpg"
+       alt="DOGS² v1 welcome screen"
        width="900">
 </p>
 
