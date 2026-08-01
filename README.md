@@ -1,6 +1,12 @@
 # DOGS²
 
 <p align="center">
+  <img src="assets/photos/all_you_need.png"
+       alt="DOGS² v1 working engineering prototype"
+       width="900">
+</p>
+
+<p align="center">
   <img src="assets/photos/dogs2-working-prototype-front.png"
        alt="DOGS² v1 working engineering prototype"
        width="900">
