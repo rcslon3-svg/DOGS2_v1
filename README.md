@@ -121,3 +121,11 @@ The v1 hardware design is licensed under
 [CERN-OHL-W-2.0](hardware/LICENSE). The firmware and software tools in
 [`software/`](software/) are licensed under the
 [GNU General Public License v3.0 only](software/LICENSE) (`GPL-3.0-only`).
+
+<p align="center">
+  <strong>
+    <a href="https://dogs2.smartmoto.asia">Visit the DOGS² project website</a>
+    ·
+    <a href="https://hackaday.io/project/206311-dogs-dual-output-generator-supply-station">Follow DOGS² on Hackaday.io</a>
+  </strong>
+</p>
