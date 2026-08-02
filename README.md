@@ -22,6 +22,14 @@ works and the firmware is under active development and tuning; published limits
 and accuracy figures should therefore be treated as engineering-sample data,
 not final product specifications.
 
+## Project status
+
+Five v1 engineering samples have been assembled. Hardware characterization,
+firmware development, documentation, enclosure work, and preparation for
+external beta testing are ongoing.
+
+Project page: [dogs2.smartmoto.asia](https://dogs2.smartmoto.asia)
+
 ## Repository structure
 
 | Directory | Contents |
@@ -50,13 +58,6 @@ not final product specifications.
 
 The 1-Wire decoder and full LIN protocol support are still in development.
 
-## Project status
-
-Five v1 engineering samples have been assembled. Hardware characterization,
-firmware development, documentation, enclosure work, and preparation for
-external beta testing are ongoing.
-
-Project page: [dogs2.smartmoto.asia](https://dogs2.smartmoto.asia)
 
 ## Working hardware
 
