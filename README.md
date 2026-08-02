@@ -108,5 +108,6 @@ Project page: [dogs2.smartmoto.asia](https://dogs2.smartmoto.asia)
 ## Licensing
 
 The v1 hardware design is licensed under
-[CERN-OHL-W-2.0](hardware/LICENSE). Firmware and other repository content will
-receive their own explicit licences before a public release.
+[CERN-OHL-W-2.0](hardware/LICENSE). The firmware and software tools in
+[`software/`](software/) are licensed under the
+[GNU General Public License v3.0 only](software/LICENSE) (`GPL-3.0-only`).
