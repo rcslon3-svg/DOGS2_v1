@@ -12,6 +12,12 @@
        width="900">
 </p>
 
+<p align="center">
+  <strong><a href="https://dogs2.smartmoto.asia">Visit the DOGS² project website</a></strong><br>
+  Project overview, beta-testing signup, and launch updates<br>
+  <a href="https://hackaday.io/project/206311-dogs-dual-output-generator-supply-station">Follow the development logs on Hackaday.io</a>
+</p>
+
 **DOGS² (Dual Output Generator Supply Station)** is an open-source, standalone
 board bring-up station. It combines two programmable power outputs, current and
 voltage monitoring, a signal generator, and common embedded-interface tools in
@@ -28,7 +34,11 @@ Five v1 engineering samples have been assembled. Hardware characterization,
 firmware development, documentation, enclosure work, and preparation for
 external beta testing are ongoing.
 
-Project page: [dogs2.smartmoto.asia](https://dogs2.smartmoto.asia)
+**Want to follow or test DOGS²?** Visit the
+[project website](https://dogs2.smartmoto.asia) for the overview and beta-test
+signup, and follow the
+[development logs on Hackaday.io](https://hackaday.io/project/206311-dogs-dual-output-generator-supply-station)
+for build updates, tests, limitations, and design progress.
 
 ## Repository structure
 
@@ -57,7 +67,6 @@ Project page: [dogs2.smartmoto.asia](https://dogs2.smartmoto.asia)
 - Bluetooth SPP command and telemetry connection.
 
 The 1-Wire decoder and full LIN protocol support are still in development.
-
 
 ## Working hardware
 
