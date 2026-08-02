@@ -46,3 +46,8 @@ reorganization.
 
 Start with [`docs/MEASUREMENT_MODES.md`](docs/MEASUREMENT_MODES.md) for a
 high-level map of the running firmware.
+
+## License
+
+The firmware and software tools in this directory are licensed under the
+[GNU General Public License v3.0 only](LICENSE) (`GPL-3.0-only`).
