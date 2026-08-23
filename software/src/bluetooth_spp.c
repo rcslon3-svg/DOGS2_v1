@@ -9,6 +9,7 @@
 #include "esp_gap_bt_api.h"
 #include "esp_spp_api.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "nvs.h"
 #include "probe_config.h"
 
@@ -28,6 +29,43 @@ static portMUX_TYPE s_tx_lock = portMUX_INITIALIZER_UNLOCKED;
 static bluetooth_command_cb_t s_command_callback;
 static char s_device_name[16] = BLUETOOTH_DEVICE_NAME;
 static uint16_t s_board_number = BLUETOOTH_DEFAULT_BOARD_NUMBER;
+static bool s_initialized;
+static bool s_ble_memory_released;
+static bool s_init_pending;
+static bool s_deinit_pending;
+static esp_err_t s_spp_start_result;
+static SemaphoreHandle_t s_spp_init_done;
+static SemaphoreHandle_t s_spp_uninit_done;
+
+static void tx_queue_clear(void);
+
+static void bluetooth_spp_force_stack_down(void)
+{
+    s_client_handle = 0U;
+    tx_queue_clear();
+    s_initialized = false;
+    s_init_pending = false;
+    s_deinit_pending = false;
+    s_command_callback = NULL;
+
+    esp_bluedroid_status_t bluedroid = esp_bluedroid_get_status();
+    if (bluedroid == ESP_BLUEDROID_STATUS_ENABLED) {
+        (void)esp_bluedroid_disable();
+        bluedroid = esp_bluedroid_get_status();
+    }
+    if (bluedroid != ESP_BLUEDROID_STATUS_UNINITIALIZED) {
+        (void)esp_bluedroid_deinit();
+    }
+
+    esp_bt_controller_status_t controller = esp_bt_controller_get_status();
+    if (controller == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        (void)esp_bt_controller_disable();
+        controller = esp_bt_controller_get_status();
+    }
+    if (controller != ESP_BT_CONTROLLER_STATUS_IDLE) {
+        (void)esp_bt_controller_deinit();
+    }
+}
 
 static void load_device_name(void)
 {
@@ -101,9 +139,30 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *parameter
 {
     switch (event) {
         case ESP_SPP_INIT_EVT:
+            if (!s_init_pending) break;
             esp_bt_gap_set_device_name(s_device_name);
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-            esp_spp_start_srv(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_SLAVE, 0, s_device_name);
+            s_spp_start_result = esp_spp_start_srv(ESP_SPP_SEC_NONE,
+                                                   ESP_SPP_ROLE_SLAVE,
+                                                   0,
+                                                   s_device_name);
+            if (s_spp_start_result != ESP_OK && s_spp_init_done != NULL) {
+                xSemaphoreGive(s_spp_init_done);
+            }
+            break;
+        case ESP_SPP_START_EVT:
+            if (!s_init_pending) break;
+            s_spp_start_result = ESP_OK;
+            s_initialized = true;
+            s_init_pending = false;
+            if (s_spp_init_done != NULL) xSemaphoreGive(s_spp_init_done);
+            break;
+        case ESP_SPP_UNINIT_EVT:
+            s_initialized = false;
+            s_deinit_pending = false;
+            s_client_handle = 0U;
+            tx_queue_clear();
+            if (s_spp_uninit_done != NULL) xSemaphoreGive(s_spp_uninit_done);
             break;
         case ESP_SPP_SRV_OPEN_EVT:
             s_client_handle = parameter->srv_open.handle;
@@ -137,21 +196,90 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *parameter
  */
 esp_err_t bluetooth_spp_init(bluetooth_command_cb_t callback)
 {
+    esp_err_t result = ESP_OK;
+    if (s_initialized) return ESP_OK;
     s_command_callback = callback;
     load_device_name();
-    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
+    if (s_spp_init_done == NULL) {
+        s_spp_init_done = xSemaphoreCreateBinary();
+        if (s_spp_init_done == NULL) return ESP_ERR_NO_MEM;
+    }
+    if (s_spp_uninit_done == NULL) {
+        s_spp_uninit_done = xSemaphoreCreateBinary();
+        if (s_spp_uninit_done == NULL) return ESP_ERR_NO_MEM;
+    }
+    while (xSemaphoreTake(s_spp_init_done, 0) == pdTRUE) {}
+    while (xSemaphoreTake(s_spp_uninit_done, 0) == pdTRUE) {}
+    s_spp_start_result = ESP_ERR_INVALID_STATE;
+    if (!s_ble_memory_released) {
+        esp_err_t release = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+        if (release != ESP_OK && release != ESP_ERR_INVALID_STATE) return release;
+        s_ble_memory_released = true;
+    }
+    s_init_pending = true;
+    s_deinit_pending = false;
     esp_bt_controller_config_t config = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_bt_controller_init(&config), "bt", "controller init");
-    ESP_RETURN_ON_ERROR(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT), "bt", "controller enable");
-    ESP_RETURN_ON_ERROR(esp_bluedroid_init(), "bt", "bluedroid init");
-    ESP_RETURN_ON_ERROR(esp_bluedroid_enable(), "bt", "bluedroid enable");
-    ESP_RETURN_ON_ERROR(esp_spp_register_callback(spp_callback), "bt", "spp callback");
+    if ((result = esp_bt_controller_init(&config)) != ESP_OK) goto fail;
+    if ((result = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT)) != ESP_OK) goto fail;
+    if ((result = esp_bluedroid_init()) != ESP_OK) goto fail;
+    if ((result = esp_bluedroid_enable()) != ESP_OK) goto fail;
+    if ((result = esp_spp_register_callback(spp_callback)) != ESP_OK) goto fail;
     const esp_spp_cfg_t spp_config = {
         .mode = ESP_SPP_MODE_CB,
         .enable_l2cap_ertm = true,
         .tx_buffer_size = 0U
     };
-    return esp_spp_enhanced_init(&spp_config);
+    if ((result = esp_spp_enhanced_init(&spp_config)) != ESP_OK) goto fail;
+    if (xSemaphoreTake(s_spp_init_done, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        result = ESP_ERR_TIMEOUT;
+        goto fail;
+    }
+    if (s_spp_start_result != ESP_OK) {
+        result = s_spp_start_result;
+        goto fail;
+    }
+    return ESP_OK;
+
+fail:
+    bluetooth_spp_force_stack_down();
+    return result;
+}
+
+esp_err_t bluetooth_spp_deinit(void)
+{
+    if (!s_initialized) return ESP_OK;
+
+    s_client_handle = 0U;
+    tx_queue_clear();
+    s_init_pending = false;
+    s_deinit_pending = true;
+    (void)esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+
+    esp_err_t result = esp_spp_deinit();
+    if (result != ESP_OK) {
+        s_deinit_pending = false;
+        return result;
+    }
+    if (xSemaphoreTake(s_spp_uninit_done, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        s_deinit_pending = false;
+        return ESP_ERR_TIMEOUT;
+    }
+    result = esp_bluedroid_disable();
+    if (result != ESP_OK) return result;
+    result = esp_bluedroid_deinit();
+    if (result != ESP_OK) return result;
+    result = esp_bt_controller_disable();
+    if (result != ESP_OK) return result;
+    result = esp_bt_controller_deinit();
+    if (result != ESP_OK) return result;
+
+    s_command_callback = NULL;
+    return ESP_OK;
+}
+
+bool bluetooth_spp_initialized(void)
+{
+    return s_initialized;
 }
 
 const char *bluetooth_spp_device_name(void)

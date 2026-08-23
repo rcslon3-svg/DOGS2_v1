@@ -2,8 +2,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include "board_io.h"
 #include "buzzer.h"
+#include "calibration.h"
+#include "current_graph.h"
 #include "driver/gpio.h"
 #include "encoder_input.h"
 #include "esp_check.h"
@@ -41,14 +44,15 @@
 #define SETTINGS_NVS_NAMESPACE "setpoints"
 #define CONTROL_U1_MIN_MV 1000U
 #define CONTROL_U1_MAX_MV 48000U
-#define CONTROL_U2_MAX_MV 19000U
+#define CONTROL_U2_MAX_MV 20000U
 #define CONTROL_I1_MAX_MA CHANNEL_B_CURRENT_LIMIT_MAX_MA
 #define CONTROL_I2_MAX_MA 2000U
 #define CONTROL_CURRENT_LIMIT_STEP_MA 50U
 #define CONTROL_OVERHEAT_MIN_C 40U
 #define CONTROL_OVERHEAT_MAX_C 70U
-#define CONTROL_OVERPOWER_MIN_W 50U
-#define CONTROL_OVERPOWER_MAX_W 150U
+#define CONTROL_OVERPOWER_OFF_W 0U
+#define CONTROL_OVERPOWER_MIN_W 10U
+#define CONTROL_OVERPOWER_MAX_W 99U
 #define CONTROL_VOLUME_MAX_PERCENT 100U
 
 static uint16_t s_u1_mv = 12000;
@@ -57,17 +61,31 @@ static uint16_t s_u2_mv = 12000;
 static uint16_t s_i2_ma = 500;
 static bool s_overcurrent_cc = true;
 static uint8_t s_overheat_c = 50U;
-static uint16_t s_overpower_w = 100U;
+static uint16_t s_overpower_w = CONTROL_OVERPOWER_MAX_W;
 static uint8_t s_volume_percent = 50U;
+static bool s_calibration_on;
+static bool s_calibration_confirm;
+static bool s_calibration_confirm_ok = true;
+static int64_t s_calibration_done_until_us;
 static bool s_channel_a_enabled;
 static bool s_channel_b_enabled;
+static bool s_calibration_override;
+static uint16_t s_cal_u1_mv;
+static uint16_t s_cal_i1_ma;
+static uint16_t s_cal_u2_mv;
+static uint16_t s_cal_i2_ma;
+static bool s_cal_channel_a_enabled;
+static bool s_cal_channel_b_enabled;
 static app_mode_t s_mode = APP_MODE_POWER_SUPPLY;
 static bool s_menu_open;
 static uint8_t s_menu_index = APP_MODE_POWER_SUPPLY;
-static size_t s_uart_baud_index = 6U;
-static size_t s_lin_baud_index = 3U;
-static size_t s_rs485_baud_index = 6U;
+static size_t s_uart_baud_index = 9U;
+static size_t s_lin_baud_index = 5U;
+static size_t s_rs485_baud_index = 9U;
 static size_t s_can_bitrate_index = 2U;
+static size_t s_current_graph_rate_index;
+static size_t s_current_graph_scale_index = 2U;
+static size_t s_current_graph_channel_index;
 static int8_t s_lin_mask[2] = {-1, -1};
 static int8_t s_can_mask[3] = {-1, -1, -1};
 static int8_t s_i2c_mask[2] = {-1, -1};
@@ -104,11 +122,19 @@ static bool s_channel_b_button_pressed_previous;
 static int64_t s_channel_b_button_last_change_us;
 
 static const uint32_t s_serial_baud_rates[] = {
-    2400U, 4800U, 9600U, 19200U, 38400U, 57600U, 115200U
+    2400U, 4800U, 9600U, 10400U, 14400U, 19200U, 20000U, 38400U, 57600U, 115200U
 };
 
 static const uint32_t s_can_bitrates[] = {
     100000U, 125000U, 250000U, 500000U, 1000000U
+};
+
+static const uint8_t s_current_graph_decimations[] = {1U, 5U, 10U};
+static const uint16_t s_current_graph_scales_ma[] = {10U, 100U, 1000U, 5000U, 0U};
+static const uint8_t s_current_graph_channels[] = {
+    CURRENT_GRAPH_CHANNEL_A | CURRENT_GRAPH_CHANNEL_B,
+    CURRENT_GRAPH_CHANNEL_A,
+    CURRENT_GRAPH_CHANNEL_B
 };
 
 static char hex_mask_digit(int8_t value)
@@ -204,7 +230,8 @@ static bool protocol_mode(app_mode_t mode)
            mode == APP_MODE_LIN ||
            mode == APP_MODE_RS485 ||
            mode == APP_MODE_CAN ||
-           mode == APP_MODE_I2C;
+           mode == APP_MODE_I2C ||
+           mode == APP_MODE_I2C_MASTER;
 }
 
 /* debounce_pressed
@@ -251,9 +278,19 @@ static uint8_t selected_digit_count(uint8_t selected)
     if (selected == CONTROL_SELECT_I1 || selected == CONTROL_SELECT_I2) return 1U;
     if (selected == CONTROL_SELECT_GEN_FREQ) return 6U;
     if (selected == CONTROL_SELECT_GEN_DUTY) return 2U;
+    if (selected == CONTROL_SELECT_GEN_ON) return 1U;
+    if (selected == CONTROL_SELECT_UART_BAUD ||
+        selected == CONTROL_SELECT_RS485_BAUD ||
+        selected == CONTROL_SELECT_LIN_BAUD ||
+        selected == CONTROL_SELECT_CAN_BITRATE) return 1U;
+    if (selected == CONTROL_SELECT_CURRENT_RATE ||
+        selected == CONTROL_SELECT_CURRENT_SCALE ||
+        selected == CONTROL_SELECT_CURRENT_CHANNEL) return 1U;
     if (selected == CONTROL_SELECT_OVERCURRENT) return 1U;
-    if (selected == CONTROL_SELECT_OVERHEAT) return 2U;
-    if (selected == CONTROL_SELECT_OVERPOWER || selected == CONTROL_SELECT_VOLUME) return 3U;
+    if (selected == CONTROL_SELECT_CALIBRATION) return 1U;
+    if (selected == CONTROL_SELECT_VOLUME) return 1U;
+    if (selected == CONTROL_SELECT_OVERHEAT) return 1U;
+    if (selected == CONTROL_SELECT_OVERPOWER) return 1U;
     if (selected == CONTROL_SELECT_LIN_MASK || selected == CONTROL_SELECT_I2C_MASK) return 2U;
     if (selected == CONTROL_SELECT_CAN_MASK) return 3U;
     return 0U;
@@ -276,13 +313,10 @@ static uint16_t selected_step(uint8_t selected, uint8_t digit)
     if ((selected == CONTROL_SELECT_I1 || selected == CONTROL_SELECT_I2) && digit == 0U) {
         return CONTROL_CURRENT_LIMIT_STEP_MA;
     }
-    if (selected == CONTROL_SELECT_OVERHEAT && digit < 2U) {
-        static const uint16_t overheat_steps[2] = {10U, 1U};
-        return overheat_steps[digit];
-    }
-    if ((selected == CONTROL_SELECT_OVERPOWER || selected == CONTROL_SELECT_VOLUME) && digit < 3U) {
-        static const uint16_t percent_steps[3] = {100U, 10U, 1U};
-        return percent_steps[digit];
+    if ((selected == CONTROL_SELECT_OVERHEAT ||
+         selected == CONTROL_SELECT_OVERPOWER ||
+         selected == CONTROL_SELECT_VOLUME) && digit == 0U) {
+        return 1U;
     }
     return 0U;
 }
@@ -323,6 +357,19 @@ static uint16_t apply_signed_step_range(uint16_t value,
     if (next < (int32_t)minimum) return minimum;
     if (next > (int32_t)maximum) return maximum;
     return (uint16_t)next;
+}
+
+static uint16_t apply_overpower_step(uint16_t value, int direction)
+{
+    if (direction > 0) {
+        if (value == CONTROL_OVERPOWER_OFF_W) return CONTROL_OVERPOWER_MIN_W;
+        if (value < CONTROL_OVERPOWER_MIN_W) return CONTROL_OVERPOWER_MIN_W;
+        return value < CONTROL_OVERPOWER_MAX_W ? (uint16_t)(value + 1U) : CONTROL_OVERPOWER_MAX_W;
+    }
+
+    if (value <= CONTROL_OVERPOWER_MIN_W) return CONTROL_OVERPOWER_OFF_W;
+    if (value > CONTROL_OVERPOWER_MAX_W) return CONTROL_OVERPOWER_MAX_W;
+    return (uint16_t)(value - 1U);
 }
 
 static uint32_t apply_signed_step_range_u32(uint32_t value,
@@ -374,13 +421,50 @@ static void load_setpoints(void)
         s_overheat_c = (uint8_t)clamp_loaded_value_range(value, CONTROL_OVERHEAT_MIN_C, CONTROL_OVERHEAT_MAX_C);
     }
     if (nvs_get_u16(nvs, "op", &value) == ESP_OK) {
-        s_overpower_w = clamp_loaded_value_range(value, CONTROL_OVERPOWER_MIN_W, CONTROL_OVERPOWER_MAX_W);
+        uint16_t loaded = value;
+        if (value == CONTROL_OVERPOWER_OFF_W) {
+            s_overpower_w = CONTROL_OVERPOWER_OFF_W;
+        } else {
+            s_overpower_w = clamp_loaded_value_range(value, CONTROL_OVERPOWER_MIN_W, CONTROL_OVERPOWER_MAX_W);
+        }
+        if (s_overpower_w != loaded) {
+            s_settings_dirty = true;
+            s_settings_last_change_us = esp_timer_get_time();
+        }
     }
     if (nvs_get_u16(nvs, "vol", &value) == ESP_OK) {
         s_volume_percent = (uint8_t)clamp_loaded_value(value, CONTROL_VOLUME_MAX_PERCENT);
     }
     if (nvs_get_u16(nvs, "ena", &value) == ESP_OK) s_channel_a_enabled = value != 0U;
     if (nvs_get_u16(nvs, "enb", &value) == ESP_OK) s_channel_b_enabled = value != 0U;
+    if (nvs_get_u16(nvs, "ub", &value) == ESP_OK &&
+        value < sizeof(s_serial_baud_rates) / sizeof(s_serial_baud_rates[0])) {
+        s_uart_baud_index = value;
+    }
+    if (nvs_get_u16(nvs, "lb", &value) == ESP_OK &&
+        value < sizeof(s_serial_baud_rates) / sizeof(s_serial_baud_rates[0])) {
+        s_lin_baud_index = value;
+    }
+    if (nvs_get_u16(nvs, "rb", &value) == ESP_OK &&
+        value < sizeof(s_serial_baud_rates) / sizeof(s_serial_baud_rates[0])) {
+        s_rs485_baud_index = value;
+    }
+    if (nvs_get_u16(nvs, "cb", &value) == ESP_OK &&
+        value < sizeof(s_can_bitrates) / sizeof(s_can_bitrates[0])) {
+        s_can_bitrate_index = value;
+    }
+    if (nvs_get_u16(nvs, "gr", &value) == ESP_OK &&
+        value < sizeof(s_current_graph_decimations) / sizeof(s_current_graph_decimations[0])) {
+        s_current_graph_rate_index = value;
+    }
+    if (nvs_get_u16(nvs, "gs", &value) == ESP_OK &&
+        value < sizeof(s_current_graph_scales_ma) / sizeof(s_current_graph_scales_ma[0])) {
+        s_current_graph_scale_index = value;
+    }
+    if (nvs_get_u16(nvs, "gc", &value) == ESP_OK &&
+        value < sizeof(s_current_graph_channels) / sizeof(s_current_graph_channels[0])) {
+        s_current_graph_channel_index = value;
+    }
 
     nvs_close(nvs);
 }
@@ -402,6 +486,13 @@ static esp_err_t save_setpoints(void)
         (err = nvs_set_u16(nvs, "vol", s_volume_percent)) != ESP_OK ||
         (err = nvs_set_u16(nvs, "ena", s_channel_a_enabled ? 1U : 0U)) != ESP_OK ||
         (err = nvs_set_u16(nvs, "enb", s_channel_b_enabled ? 1U : 0U)) != ESP_OK ||
+        (err = nvs_set_u16(nvs, "ub", (uint16_t)s_uart_baud_index)) != ESP_OK ||
+        (err = nvs_set_u16(nvs, "lb", (uint16_t)s_lin_baud_index)) != ESP_OK ||
+        (err = nvs_set_u16(nvs, "rb", (uint16_t)s_rs485_baud_index)) != ESP_OK ||
+        (err = nvs_set_u16(nvs, "cb", (uint16_t)s_can_bitrate_index)) != ESP_OK ||
+        (err = nvs_set_u16(nvs, "gr", (uint16_t)s_current_graph_rate_index)) != ESP_OK ||
+        (err = nvs_set_u16(nvs, "gs", (uint16_t)s_current_graph_scale_index)) != ESP_OK ||
+        (err = nvs_set_u16(nvs, "gc", (uint16_t)s_current_graph_channel_index)) != ESP_OK ||
         (err = nvs_commit(nvs)) != ESP_OK) {
         nvs_close(nvs);
         return err;
@@ -449,11 +540,17 @@ static void move_mode_menu(int direction)
     }
 }
 
+static uint8_t first_selection_for_mode(app_mode_t mode);
+static void select_whole_value(uint8_t selected);
+
 static void select_mode_menu_item(void)
 {
     s_mode = (app_mode_t)s_menu_index;
     close_mode_menu();
     clear_selection();
+    if (s_mode == APP_MODE_UART || s_mode == APP_MODE_RS485) {
+        select_whole_value(first_selection_for_mode(s_mode));
+    }
 }
 
 static void select_whole_value(uint8_t selected)
@@ -476,6 +573,7 @@ static uint8_t first_selection_for_mode(app_mode_t mode)
         case APP_MODE_GENERATOR:    return CONTROL_SELECT_GEN_FREQ;
         case APP_MODE_UART:         return CONTROL_SELECT_UART_BAUD;
         case APP_MODE_LIN:          return CONTROL_SELECT_LIN_BAUD;
+        case APP_MODE_1WIRE:        return CONTROL_SELECT_CURRENT_RATE;
         case APP_MODE_RS485:        return CONTROL_SELECT_RS485_BAUD;
         case APP_MODE_CAN:          return CONTROL_SELECT_CAN_BITRATE;
         case APP_MODE_I2C:          return CONTROL_SELECT_I2C_MASK;
@@ -543,6 +641,16 @@ static void change_setting_value(int direction)
         }
         return;
     }
+    if (s_selected_value == CONTROL_SELECT_CALIBRATION) {
+        if (s_selected_digit != CONTROL_DIGIT_WHOLE) {
+            s_calibration_on = !s_calibration_on;
+            if (s_calibration_on) {
+                s_calibration_confirm = true;
+                s_calibration_confirm_ok = true;
+            }
+        }
+        return;
+    }
 
     if (s_selected_digit == CONTROL_DIGIT_WHOLE) return;
     uint16_t step = selected_step(s_selected_value, s_selected_digit);
@@ -563,10 +671,7 @@ static void change_setting_value(int direction)
         case CONTROL_SELECT_OVERPOWER:
         {
             uint16_t old = s_overpower_w;
-            s_overpower_w = apply_signed_step_range(s_overpower_w,
-                                                    delta,
-                                                    CONTROL_OVERPOWER_MIN_W,
-                                                    CONTROL_OVERPOWER_MAX_W);
+            s_overpower_w = apply_overpower_step(s_overpower_w, direction);
             if (s_overpower_w != old) mark_setpoints_changed();
             break;
         }
@@ -588,10 +693,10 @@ static void change_generator_value(int direction)
 {
     generator_output_state_t generator = generator_output_get_state();
 
-    if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
-        if (s_selected_value == CONTROL_SELECT_GEN_ON) {
-            generator_output_set_enabled(!generator.enabled);
-        }
+    if (s_selected_digit == CONTROL_DIGIT_WHOLE) return;
+
+    if (s_selected_value == CONTROL_SELECT_GEN_ON) {
+        generator_output_set_enabled(direction >= 0);
         return;
     }
 
@@ -629,7 +734,10 @@ static void move_index(size_t *index, size_t count, int direction)
 
 static void change_protocol_value(int direction)
 {
-    if (s_selected_digit != CONTROL_DIGIT_WHOLE) {
+    if (s_selected_digit != CONTROL_DIGIT_WHOLE && mask_selection(s_selected_value)) {
+        int8_t old_lin_mask[2] = {s_lin_mask[0], s_lin_mask[1]};
+        int8_t old_can_mask[3] = {s_can_mask[0], s_can_mask[1], s_can_mask[2]};
+        int8_t old_i2c_mask[2] = {s_i2c_mask[0], s_i2c_mask[1]};
         switch (s_selected_value) {
             case CONTROL_SELECT_LIN_MASK:
                 change_mask_digit(s_lin_mask, 2U, direction);
@@ -643,9 +751,18 @@ static void change_protocol_value(int direction)
             default:
                 break;
         }
+        if (memcmp(old_lin_mask, s_lin_mask, sizeof(old_lin_mask)) != 0 ||
+            memcmp(old_can_mask, s_can_mask, sizeof(old_can_mask)) != 0 ||
+            memcmp(old_i2c_mask, s_i2c_mask, sizeof(old_i2c_mask)) != 0) {
+            mark_setpoints_changed();
+        }
         return;
     }
 
+    size_t old_uart = s_uart_baud_index;
+    size_t old_lin = s_lin_baud_index;
+    size_t old_rs485 = s_rs485_baud_index;
+    size_t old_can = s_can_bitrate_index;
     switch (s_selected_value) {
         case CONTROL_SELECT_UART_BAUD:
             move_index(&s_uart_baud_index,
@@ -669,6 +786,64 @@ static void change_protocol_value(int direction)
             break;
         default:
             break;
+    }
+    if (s_uart_baud_index != old_uart ||
+        s_lin_baud_index != old_lin ||
+        s_rs485_baud_index != old_rs485 ||
+        s_can_bitrate_index != old_can) {
+        mark_setpoints_changed();
+    }
+}
+
+static void move_current_graph_selection(int direction)
+{
+    if (direction >= 0) {
+        switch (s_selected_value) {
+            case CONTROL_SELECT_CURRENT_RATE:    select_whole_value(CONTROL_SELECT_CURRENT_SCALE); break;
+            case CONTROL_SELECT_CURRENT_SCALE:   select_whole_value(CONTROL_SELECT_CURRENT_CHANNEL); break;
+            case CONTROL_SELECT_CURRENT_CHANNEL: select_whole_value(CONTROL_SELECT_NONE); break;
+            default:                             select_whole_value(CONTROL_SELECT_CURRENT_RATE); break;
+        }
+    } else {
+        switch (s_selected_value) {
+            case CONTROL_SELECT_CURRENT_RATE:    select_whole_value(CONTROL_SELECT_NONE); break;
+            case CONTROL_SELECT_CURRENT_SCALE:   select_whole_value(CONTROL_SELECT_CURRENT_RATE); break;
+            case CONTROL_SELECT_CURRENT_CHANNEL: select_whole_value(CONTROL_SELECT_CURRENT_SCALE); break;
+            default:                             select_whole_value(CONTROL_SELECT_CURRENT_CHANNEL); break;
+        }
+    }
+}
+
+static void change_current_graph_value(int direction)
+{
+    size_t old_rate = s_current_graph_rate_index;
+    size_t old_scale = s_current_graph_scale_index;
+    size_t old_channel = s_current_graph_channel_index;
+
+    switch (s_selected_value) {
+        case CONTROL_SELECT_CURRENT_RATE:
+            move_index(&s_current_graph_rate_index,
+                       sizeof(s_current_graph_decimations) / sizeof(s_current_graph_decimations[0]),
+                       direction);
+            break;
+        case CONTROL_SELECT_CURRENT_SCALE:
+            move_index(&s_current_graph_scale_index,
+                       sizeof(s_current_graph_scales_ma) / sizeof(s_current_graph_scales_ma[0]),
+                       direction);
+            break;
+        case CONTROL_SELECT_CURRENT_CHANNEL:
+            move_index(&s_current_graph_channel_index,
+                       sizeof(s_current_graph_channels) / sizeof(s_current_graph_channels[0]),
+                       direction);
+            break;
+        default:
+            break;
+    }
+
+    if (s_current_graph_rate_index != old_rate ||
+        s_current_graph_scale_index != old_scale ||
+        s_current_graph_channel_index != old_channel) {
+        mark_setpoints_changed();
     }
 }
 
@@ -727,7 +902,8 @@ static void move_setting_selection(int direction)
             case CONTROL_SELECT_OVERCURRENT: select_whole_value(CONTROL_SELECT_OVERHEAT); break;
             case CONTROL_SELECT_OVERHEAT:    select_whole_value(CONTROL_SELECT_OVERPOWER); break;
             case CONTROL_SELECT_OVERPOWER:   select_whole_value(CONTROL_SELECT_VOLUME); break;
-            case CONTROL_SELECT_VOLUME:      select_whole_value(CONTROL_SELECT_NONE); break;
+            case CONTROL_SELECT_VOLUME:      select_whole_value(CONTROL_SELECT_CALIBRATION); break;
+            case CONTROL_SELECT_CALIBRATION: select_whole_value(CONTROL_SELECT_NONE); break;
             default:                         select_whole_value(CONTROL_SELECT_OVERCURRENT); break;
         }
     } else {
@@ -736,7 +912,8 @@ static void move_setting_selection(int direction)
             case CONTROL_SELECT_OVERHEAT:    select_whole_value(CONTROL_SELECT_OVERCURRENT); break;
             case CONTROL_SELECT_OVERPOWER:   select_whole_value(CONTROL_SELECT_OVERHEAT); break;
             case CONTROL_SELECT_VOLUME:      select_whole_value(CONTROL_SELECT_OVERPOWER); break;
-            default:                         select_whole_value(CONTROL_SELECT_VOLUME); break;
+            case CONTROL_SELECT_CALIBRATION: select_whole_value(CONTROL_SELECT_VOLUME); break;
+            default:                         select_whole_value(CONTROL_SELECT_CALIBRATION); break;
         }
     }
 }
@@ -751,12 +928,6 @@ static void move_setting_selection(int direction)
 static void move_whole_selection(int direction)
 {
     if (s_mode == APP_MODE_GENERATOR) {
-        if (s_selected_value == CONTROL_SELECT_GEN_ON) {
-            generator_output_state_t generator = generator_output_get_state();
-            generator_output_set_enabled(!generator.enabled);
-            select_whole_value(direction >= 0 ? CONTROL_SELECT_NONE : CONTROL_SELECT_GEN_DUTY);
-            return;
-        }
         if (direction >= 0) {
             switch (s_selected_value) {
                 case CONTROL_SELECT_GEN_FREQ: select_whole_value(CONTROL_SELECT_GEN_DUTY); break;
@@ -774,6 +945,8 @@ static void move_whole_selection(int direction)
         }
     } else if (s_mode == APP_MODE_SETTING) {
         move_setting_selection(direction);
+    } else if (s_mode == APP_MODE_1WIRE) {
+        move_current_graph_selection(direction);
     } else if (protocol_mode(s_mode)) {
         move_protocol_selection(direction);
     } else if (direction >= 0) {
@@ -795,43 +968,83 @@ static void move_whole_selection(int direction)
     }
 }
 
-/* button_advance_selection
- * Inputs: none.
- * Returns: none.
- * Does: one button selects channel A voltage from idle, enters digit editing
- * from a whole-value selection at the least significant digit, then moves
- * toward more significant digits and cycles back to whole-value selection.
- */
-static void button_advance_selection(void)
+static void finish_editing(void)
 {
-    if (s_selected_value == CONTROL_SELECT_NONE) {
-        select_whole_value(first_selection_for_mode(s_mode));
+    clear_selection();
+}
+
+static void start_editing_selected(void)
+{
+    if (s_selected_value == CONTROL_SELECT_NONE) return;
+
+    uint8_t count = selected_digit_count(s_selected_value);
+    if (count == 0U) return;
+
+    if (s_selected_value == CONTROL_SELECT_U1 || s_selected_value == CONTROL_SELECT_U2) {
+        s_selected_digit = 2U;
+    } else if (mask_selection(s_selected_value)) {
+        s_selected_digit = 0U;
+    } else {
+        s_selected_digit = count - 1U;
+    }
+}
+
+static void menu_button_action(void)
+{
+    if (s_calibration_confirm) {
+        if (s_calibration_confirm_ok) {
+            calibration_request_start();
+        } else {
+            s_calibration_on = false;
+        }
+        s_calibration_confirm = false;
+        s_selected_digit = CONTROL_DIGIT_WHOLE;
         return;
     }
 
-    uint8_t count = selected_digit_count(s_selected_value);
-    if (count == 0U) {
-        if (s_selected_value == CONTROL_SELECT_GEN_ON) {
-            generator_output_state_t generator = generator_output_get_state();
-            generator_output_set_enabled(!generator.enabled);
-        } else if (protocol_mode(s_mode)) {
-            move_protocol_selection(1);
-        }
+    if (s_selected_value == CONTROL_SELECT_NONE) {
+        open_mode_menu();
+        return;
+    }
+
+    if ((s_mode == APP_MODE_UART || s_mode == APP_MODE_RS485) &&
+        s_selected_digit == CONTROL_DIGIT_WHOLE) {
+        finish_editing();
         return;
     }
 
     if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
-        s_selected_digit = mask_selection(s_selected_value) ? 0U : (uint8_t)(count - 1U);
-    } else if ((!mask_selection(s_selected_value) && s_selected_digit == 0U) ||
-               (mask_selection(s_selected_value) && s_selected_digit >= count - 1U)) {
-        if (s_mode == APP_MODE_CAN && s_selected_value == CONTROL_SELECT_CAN_MASK) {
-            select_whole_value(CONTROL_SELECT_CAN_BITRATE);
-        } else {
-            s_selected_digit = CONTROL_DIGIT_WHOLE;
-        }
+        start_editing_selected();
     } else {
-        if (mask_selection(s_selected_value)) ++s_selected_digit;
-        else --s_selected_digit;
+        if (s_selected_value == CONTROL_SELECT_CALIBRATION && s_calibration_on) {
+            s_calibration_confirm = true;
+            s_calibration_confirm_ok = true;
+        }
+        finish_editing();
+    }
+}
+
+static void encoder_button_action(void)
+{
+    if (s_calibration_confirm) {
+        s_calibration_confirm_ok = !s_calibration_confirm_ok;
+        return;
+    }
+
+    if (s_selected_value == CONTROL_SELECT_NONE) {
+        return;
+    }
+
+    if (s_selected_digit == CONTROL_DIGIT_WHOLE) return;
+
+    uint8_t count = selected_digit_count(s_selected_value);
+    if (count == 0U || count == 1U) return;
+
+    if (mask_selection(s_selected_value)) {
+        s_selected_digit = (uint8_t)((s_selected_digit + 1U) % count);
+    } else {
+        s_selected_digit = (s_selected_digit == 0U) ? (uint8_t)(count - 1U) :
+                                                     (uint8_t)(s_selected_digit - 1U);
     }
 }
 
@@ -916,6 +1129,23 @@ void control_force_channel_enabled(char channel, bool enabled)
     s_settings_last_change_us = 0;
 }
 
+void control_calibration_override(bool active,
+                                  uint16_t u2_mv,
+                                  uint16_t i2_ma,
+                                  bool channel_a_enabled,
+                                  uint16_t u1_mv,
+                                  uint16_t i1_ma,
+                                  bool channel_b_enabled)
+{
+    s_calibration_override = active;
+    s_cal_u2_mv = u2_mv;
+    s_cal_i2_ma = i2_ma;
+    s_cal_channel_a_enabled = channel_a_enabled;
+    s_cal_u1_mv = u1_mv;
+    s_cal_i1_ma = i1_ma;
+    s_cal_channel_b_enabled = channel_b_enabled;
+}
+
 void control_update(app_state_t *state)
 {
     int64_t now_us = esp_timer_get_time();
@@ -962,30 +1192,38 @@ void control_update(app_state_t *state)
                                                      &s_channel_b_button_stable,
                                                      &s_channel_b_button_last_change_us,
                                                      &s_channel_b_button_pressed_previous);
-    if (mode_button_pressed) {
-        if (s_menu_open) close_mode_menu();
-        else open_mode_menu();
-        mark_control_activity(now_us);
-    }
+    (void)ui_pressed;
+    bool calibration_input_locked = calibration_running() || calibration_done();
 
-    if (channel_a_button_pressed) {
+    if (!s_calibration_confirm && !calibration_input_locked && channel_a_button_pressed) {
         s_channel_a_enabled = !s_channel_a_enabled;
         buzzer_beep_1khz_50ms();
         mark_setpoints_changed();
         mark_control_activity(now_us);
     }
-    if (channel_b_button_pressed) {
+    if (!s_calibration_confirm && !calibration_input_locked && channel_b_button_pressed) {
         s_channel_b_enabled = !s_channel_b_enabled;
         buzzer_beep_1khz_50ms();
         mark_setpoints_changed();
         mark_control_activity(now_us);
     }
 
-    if ((ui_pressed || encoder_button_pressed) && s_menu_open) {
+    if (mode_button_pressed && s_calibration_confirm) {
+        menu_button_action();
+        mark_control_activity(now_us);
+    } else if (encoder_button_pressed && s_calibration_confirm) {
+        encoder_button_action();
+        mark_control_activity(now_us);
+    } else if (!calibration_input_locked && mode_button_pressed && s_menu_open) {
         select_mode_menu_item();
         mark_control_activity(now_us);
-    } else if (ui_pressed || encoder_button_pressed) {
-        button_advance_selection();
+    } else if (!calibration_input_locked && encoder_button_pressed && s_menu_open) {
+        /* Encoder button no longer selects menu items. */
+    } else if (!calibration_input_locked && mode_button_pressed) {
+        menu_button_action();
+        mark_control_activity(now_us);
+    } else if (!calibration_input_locked && encoder_button_pressed) {
+        encoder_button_action();
         mark_control_activity(now_us);
     }
 
@@ -995,14 +1233,31 @@ void control_update(app_state_t *state)
         mark_control_activity(now_us);
     }
     while (encoder_steps > 0) {
-        if (s_menu_open) {
+        if (calibration_input_locked) {
+            /* Ignore edits while the calibration state machine owns the outputs. */
+        } else if (s_calibration_confirm) {
+            s_calibration_confirm_ok = !s_calibration_confirm_ok;
+        } else if (s_menu_open) {
             move_mode_menu(1);
-        } else if (protocol_mode(s_mode)) {
-            if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
-                change_protocol_value(1);
-            } else {
-                change_protocol_value(1);
-            }
+        } else if ((s_mode == APP_MODE_UART || s_mode == APP_MODE_RS485) &&
+                   s_selected_value == CONTROL_SELECT_NONE) {
+            select_whole_value(first_selection_for_mode(s_mode));
+            change_protocol_value(1);
+        } else if (s_mode == APP_MODE_I2C &&
+                   s_selected_value == CONTROL_SELECT_NONE) {
+            select_whole_value(CONTROL_SELECT_I2C_MASK);
+            s_selected_digit = 0U;
+            change_protocol_value(1);
+        } else if (s_mode == APP_MODE_UART || s_mode == APP_MODE_RS485) {
+            change_protocol_value(1);
+        } else if (s_mode == APP_MODE_LIN || s_mode == APP_MODE_CAN) {
+            if (s_selected_digit == CONTROL_DIGIT_WHOLE) move_protocol_selection(1);
+            else change_protocol_value(1);
+        } else if (s_mode == APP_MODE_I2C) {
+            change_protocol_value(1);
+        } else if (s_mode == APP_MODE_1WIRE &&
+                   s_selected_digit != CONTROL_DIGIT_WHOLE) {
+            change_current_graph_value(1);
         } else if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
             move_whole_selection(1);
         } else if (s_mode == APP_MODE_GENERATOR) {
@@ -1015,14 +1270,31 @@ void control_update(app_state_t *state)
         --encoder_steps;
     }
     while (encoder_steps < 0) {
-        if (s_menu_open) {
+        if (calibration_input_locked) {
+            /* Ignore edits while the calibration state machine owns the outputs. */
+        } else if (s_calibration_confirm) {
+            s_calibration_confirm_ok = !s_calibration_confirm_ok;
+        } else if (s_menu_open) {
             move_mode_menu(-1);
-        } else if (protocol_mode(s_mode)) {
-            if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
-                change_protocol_value(-1);
-            } else {
-                change_protocol_value(-1);
-            }
+        } else if ((s_mode == APP_MODE_UART || s_mode == APP_MODE_RS485) &&
+                   s_selected_value == CONTROL_SELECT_NONE) {
+            select_whole_value(first_selection_for_mode(s_mode));
+            change_protocol_value(-1);
+        } else if (s_mode == APP_MODE_I2C &&
+                   s_selected_value == CONTROL_SELECT_NONE) {
+            select_whole_value(CONTROL_SELECT_I2C_MASK);
+            s_selected_digit = 0U;
+            change_protocol_value(-1);
+        } else if (s_mode == APP_MODE_UART || s_mode == APP_MODE_RS485) {
+            change_protocol_value(-1);
+        } else if (s_mode == APP_MODE_LIN || s_mode == APP_MODE_CAN) {
+            if (s_selected_digit == CONTROL_DIGIT_WHOLE) move_protocol_selection(-1);
+            else change_protocol_value(-1);
+        } else if (s_mode == APP_MODE_I2C) {
+            change_protocol_value(-1);
+        } else if (s_mode == APP_MODE_1WIRE &&
+                   s_selected_digit != CONTROL_DIGIT_WHOLE) {
+            change_current_graph_value(-1);
         } else if (s_selected_digit == CONTROL_DIGIT_WHOLE) {
             move_whole_selection(-1);
         } else if (s_mode == APP_MODE_GENERATOR) {
@@ -1046,6 +1318,23 @@ void control_update(app_state_t *state)
         s_selected_digit = CONTROL_DIGIT_WHOLE;
     }
 
+    if (calibration_done()) {
+        if (s_calibration_done_until_us == 0) {
+            s_calibration_done_until_us = now_us + 1000000LL;
+            s_calibration_on = true;
+        } else if (now_us >= s_calibration_done_until_us) {
+            calibration_clear_done();
+            s_calibration_done_until_us = 0;
+            s_calibration_on = false;
+            s_calibration_confirm = false;
+            s_mode = APP_MODE_SETTING;
+            s_menu_open = false;
+            select_whole_value(CONTROL_SELECT_CALIBRATION);
+        }
+    } else {
+        s_calibration_done_until_us = 0;
+    }
+
     state->control.encoder_a = encoder_a;
     state->control.encoder_b = encoder_b;
     state->control.ui_button = ui_button;
@@ -1054,10 +1343,10 @@ void control_update(app_state_t *state)
     state->control.mode = s_mode;
     state->control.menu_open = s_menu_open;
     state->control.menu_index = s_menu_index;
-    state->control.u1_mv = s_u1_mv;
-    state->control.i1_ma = s_i1_ma;
-    state->control.u2_mv = s_u2_mv;
-    state->control.i2_ma = s_i2_ma;
+    state->control.u1_mv = s_calibration_override ? s_cal_u1_mv : s_u1_mv;
+    state->control.i1_ma = s_calibration_override ? s_cal_i1_ma : s_i1_ma;
+    state->control.u2_mv = s_calibration_override ? s_cal_u2_mv : s_u2_mv;
+    state->control.i2_ma = s_calibration_override ? s_cal_i2_ma : s_i2_ma;
     generator_output_state_t generator = generator_output_get_state();
     state->control.generator_freq_hz = generator.frequency_hz;
     state->control.generator_duty_percent = generator.duty_percent;
@@ -1066,6 +1355,9 @@ void control_update(app_state_t *state)
     state->control.lin_baud = s_serial_baud_rates[s_lin_baud_index];
     state->control.rs485_baud = s_serial_baud_rates[s_rs485_baud_index];
     state->control.can_bitrate = s_can_bitrates[s_can_bitrate_index];
+    state->control.current_graph_decimation = s_current_graph_decimations[s_current_graph_rate_index];
+    state->control.current_graph_scale_ma = s_current_graph_scales_ma[s_current_graph_scale_index];
+    state->control.current_graph_channels = s_current_graph_channels[s_current_graph_channel_index];
     format_hex_mask(s_lin_mask, 2U, state->control.lin_mask);
     format_hex_mask(s_can_mask, 3U, state->control.can_mask);
     format_hex_mask(s_i2c_mask, 2U, state->control.i2c_mask);
@@ -1079,8 +1371,18 @@ void control_update(app_state_t *state)
     state->control.overheat_c = s_overheat_c;
     state->control.overpower_w = s_overpower_w;
     state->control.volume_percent = s_volume_percent;
-    state->control.channel_a_enabled = s_channel_a_enabled;
-    state->control.channel_b_enabled = s_channel_b_enabled;
+    state->control.calibration_on = s_calibration_on;
+    state->control.calibration_running = calibration_running();
+    state->control.calibration_confirm = s_calibration_confirm;
+    state->control.calibration_confirm_ok = s_calibration_confirm_ok;
+    state->control.calibration_done = calibration_done();
+    calibration_get_progress(&state->control.calibration_channel,
+                             &state->control.calibration_target_mv,
+                             &state->control.calibration_measured_mv,
+                             &state->control.calibration_measured_current_ua,
+                             &state->control.calibration_sample_count);
+    state->control.channel_a_enabled = s_calibration_override ? s_cal_channel_a_enabled : s_channel_a_enabled;
+    state->control.channel_b_enabled = s_calibration_override ? s_cal_channel_b_enabled : s_channel_b_enabled;
     state->control.selected_value = s_selected_value;
     state->control.selected_digit = s_selected_digit;
     state->control.last_encoder_steps = s_last_encoder_steps;

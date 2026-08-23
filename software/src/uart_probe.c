@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "lin_sniffer.h"
 #include "probe_config.h"
 
 #define UART_A_PORT UART_NUM_1
@@ -31,40 +32,6 @@ static bool s_uart_ready;
 static bool s_uart_pins_active;
 static volatile app_mode_t s_active_mode = APP_MODE_POWER_SUPPLY;
 static volatile uint32_t s_active_baud = UART_TEST_BAUD;
-static uint16_t s_lin_mask_value;
-static uint8_t s_lin_mask_care;
-static bool s_bt_was_connected;
-static bool s_rs485_hint_sent;
-
-static int hex_value(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-}
-
-static bool address_matches_mask(uint16_t address, uint8_t digits, uint16_t mask_value, uint8_t mask_care)
-{
-    if (mask_care == 0U) return true;
-    for (uint8_t i = 0U; i < digits; ++i) {
-        if ((mask_care & (uint8_t)(1U << i)) == 0U) continue;
-        uint8_t shift = (uint8_t)((digits - 1U - i) * 4U);
-        if (((address >> shift) & 0x0FU) != ((mask_value >> shift) & 0x0FU)) return false;
-    }
-    return true;
-}
-
-static uint8_t lin_line_address(const char *line)
-{
-    int hi = hex_value(line[0]);
-    int lo = hex_value(line[1]);
-    if (hi >= 0 && lo >= 0 &&
-        (line[2] == '\0' || line[2] == ' ' || line[2] == ':' || line[2] == ',')) {
-        return (uint8_t)((hi << 4) | lo);
-    }
-    return (uint8_t)line[0];
-}
 
 static int64_t rs485_packet_timeout_us(void)
 {
@@ -83,26 +50,6 @@ static int64_t uart_line_timeout_us(void)
 static bool uart_protocol_mode(app_mode_t mode)
 {
     return mode == APP_MODE_UART || mode == APP_MODE_LIN || mode == APP_MODE_RS485;
-}
-
-static void rs485_hint_update(app_mode_t mode, bool entering_rs485)
-{
-    bool bt_connected = bluetooth_spp_connected();
-    bool bt_connected_now = bt_connected && !s_bt_was_connected;
-
-    if (mode != APP_MODE_RS485 || !bt_connected) {
-        s_rs485_hint_sent = false;
-    }
-
-    if (mode == APP_MODE_RS485 && bt_connected && !s_rs485_hint_sent &&
-        (entering_rs485 || bt_connected_now)) {
-        static const char hint[] =
-            "[RS485 HINT] Set in Setting -> Send: Newline - None, Edit mode - HEX.\r\n";
-        bluetooth_spp_write(hint, sizeof(hint) - 1U);
-        s_rs485_hint_sent = true;
-    }
-
-    s_bt_was_connected = bt_connected;
 }
 
 static void uart_probe_set_pins_active(bool active)
@@ -148,12 +95,15 @@ static void uart_line_store_and_forward(const char *line, bool truncated)
     char preview[UART_DISPLAY_CHARS + 1U];
     size_t length = strlen(line);
 
-    if (s_active_mode == APP_MODE_LIN &&
-        !address_matches_mask(lin_line_address(line), 2U, s_lin_mask_value, s_lin_mask_care)) {
-        return;
-    }
-
-    if (length > UART_PREVIEW_CHARS || truncated) {
+    if (s_active_mode == APP_MODE_LIN) {
+        const char *status = strstr(line, " CRC");
+        const char *parity = strstr(line, " PAR:");
+        const char *end = status != NULL ? status : parity;
+        length = end != NULL ? (size_t)(end - line) : length;
+        if (length > UART_DISPLAY_CHARS) length = UART_DISPLAY_CHARS;
+        memcpy(preview, line, length);
+        preview[length] = '\0';
+    } else if (length > UART_PREVIEW_CHARS || truncated) {
         memcpy(preview, line, UART_PREVIEW_CHARS);
         memcpy(preview + UART_PREVIEW_CHARS, "...", 4U);
     } else {
@@ -296,7 +246,9 @@ static void uart_a_rx_task(void *argument)
                 rs485_packet_store_and_forward(packet, packet_used, packet_truncated);
                 packet_used = 0U;
                 packet_truncated = false;
-            } else if ((s_active_mode == APP_MODE_UART || s_active_mode == APP_MODE_LIN) &&
+            } else if (s_active_mode == APP_MODE_LIN) {
+                lin_sniffer_poll(esp_timer_get_time(), uart_line_store_and_forward);
+            } else if (s_active_mode == APP_MODE_UART &&
                        used != 0U &&
                        esp_timer_get_time() - last_uart_byte_us >= uart_line_timeout_us()) {
                 line[used] = '\0';
@@ -325,6 +277,10 @@ static void uart_a_rx_task(void *argument)
                                 packet_truncated = true;
                             }
                             last_rs485_byte_us = esp_timer_get_time();
+                            continue;
+                        }
+                        if (s_active_mode == APP_MODE_LIN) {
+                            lin_sniffer_on_byte(byte, esp_timer_get_time(), uart_line_store_and_forward);
                             continue;
                         }
 
@@ -364,6 +320,11 @@ static void uart_a_rx_task(void *argument)
             case UART_PARITY_ERR:
             case UART_FRAME_ERR:
             case UART_BREAK:
+                if (s_active_mode == APP_MODE_LIN &&
+                    (event.type == UART_BREAK || event.type == UART_FRAME_ERR)) {
+                    lin_sniffer_on_break();
+                    break;
+                }
                 if (!uart_error_is_static_low_artifact(event.type)) uart_error_add(1U);
                 break;
 
@@ -408,17 +369,16 @@ void uart_probe_configure(app_mode_t mode,
 {
     uint32_t baud = mode == APP_MODE_RS485 ? rs485_baud :
                     mode == APP_MODE_LIN ? lin_baud : uart_baud;
-    s_lin_mask_value = lin_mask_value;
-    s_lin_mask_care = lin_mask_care;
+    lin_sniffer_configure(lin_baud, lin_mask_value, lin_mask_care);
 
     if (!uart_protocol_mode(mode)) {
         uart_probe_set_pins_active(false);
-        rs485_hint_update(mode, false);
         if (mode != s_active_mode) {
             portENTER_CRITICAL(&s_uart_text_lock);
             memset(s_uart_a_lines, 0, sizeof(s_uart_a_lines));
             s_uart_a_text[0] = '\0';
             portEXIT_CRITICAL(&s_uart_text_lock);
+            lin_sniffer_reset();
             s_active_mode = mode;
         }
         return;
@@ -436,13 +396,12 @@ void uart_probe_configure(app_mode_t mode,
         s_active_baud = baud;
     }
 
-    rs485_hint_update(mode, mode == APP_MODE_RS485 && s_active_mode != APP_MODE_RS485);
-
     if (mode != s_active_mode) {
         portENTER_CRITICAL(&s_uart_text_lock);
         memset(s_uart_a_lines, 0, sizeof(s_uart_a_lines));
         s_uart_a_text[0] = '\0';
         portEXIT_CRITICAL(&s_uart_text_lock);
+        lin_sniffer_reset();
         s_active_mode = mode;
     }
 }

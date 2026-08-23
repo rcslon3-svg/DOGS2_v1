@@ -4,6 +4,8 @@
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "i2c_bus.h"
 #include "probe_config.h"
 
@@ -13,6 +15,8 @@
 #define PCA9557_REG_CONFIG     0x03U
 
 #define BIT_U8(bit) ((uint8_t)(1U << (bit)))
+#define BOARD_IO_I2C_TIMEOUT_MS 5
+#define BOARD_IO_ERROR_BACKOFF_US 200000LL
 
 #if LOGIC_V2_BOARD_REV == LOGIC_V2_BOARD_ENGINEERING_SAMPLE
 
@@ -28,6 +32,8 @@ static bool s_test_100hz_level;
 static app_mode_t s_last_mode = APP_MODE_POWER_SUPPLY;
 static uint8_t s_last_ui_input = 0xFFU;
 static bool s_ui_input_valid;
+static int64_t s_ctrl_next_retry_us;
+static int64_t s_ui_next_retry_us;
 
 static esp_err_t add_expander(uint8_t address, i2c_master_dev_handle_t *handle)
 {
@@ -45,13 +51,60 @@ static esp_err_t add_expander(uint8_t address, i2c_master_dev_handle_t *handle)
 static esp_err_t write_reg(i2c_master_dev_handle_t handle, uint8_t reg, uint8_t value)
 {
     uint8_t bytes[2] = {reg, value};
-    return i2c_master_transmit(handle, bytes, sizeof(bytes), 100);
+    return i2c_master_transmit(handle, bytes, sizeof(bytes), BOARD_IO_I2C_TIMEOUT_MS);
 }
 
 static esp_err_t read_reg(i2c_master_dev_handle_t handle, uint8_t reg, uint8_t *value)
 {
     if (value == NULL) return ESP_ERR_INVALID_ARG;
-    return i2c_master_transmit_receive(handle, &reg, 1, value, 1, 100);
+    return i2c_master_transmit_receive(handle, &reg, 1, value, 1, BOARD_IO_I2C_TIMEOUT_MS);
+}
+
+static esp_err_t read_reg_timeout(i2c_master_dev_handle_t handle,
+                                  uint8_t reg,
+                                  uint8_t *value,
+                                  int timeout_ms)
+{
+    if (value == NULL) return ESP_ERR_INVALID_ARG;
+    return i2c_master_transmit_receive(handle, &reg, 1, value, 1, timeout_ms);
+}
+
+static esp_err_t configure_expander_checked(i2c_master_dev_handle_t handle,
+                                            uint8_t output,
+                                            uint8_t config,
+                                            uint8_t *input)
+{
+    esp_err_t last_err = ESP_FAIL;
+
+    for (uint8_t attempt = 0U; attempt < 3U; ++attempt) {
+        last_err = write_reg(handle, PCA9557_REG_OUTPUT, output);
+        if (last_err == ESP_OK) last_err = write_reg(handle, PCA9557_REG_POLARITY, 0x00U);
+        if (last_err == ESP_OK) last_err = write_reg(handle, PCA9557_REG_CONFIG, config);
+
+        uint8_t read_output = 0U;
+        uint8_t read_config = 0U;
+        if (last_err == ESP_OK) last_err = read_reg(handle, PCA9557_REG_OUTPUT, &read_output);
+        if (last_err == ESP_OK) last_err = read_reg(handle, PCA9557_REG_CONFIG, &read_config);
+        if (last_err == ESP_OK && read_output == output && read_config == config) {
+            if (input != NULL) {
+                last_err = read_reg(handle, PCA9557_REG_INPUT, input);
+            }
+            return last_err;
+        }
+
+        if (last_err == ESP_OK) last_err = ESP_ERR_INVALID_RESPONSE;
+        ESP_LOGW(TAG,
+                 "expander verify attempt %u failed: out %02X/%02X cfg %02X/%02X %s",
+                 (unsigned)(attempt + 1U),
+                 read_output,
+                 output,
+                 read_config,
+                 config,
+                 esp_err_to_name(last_err));
+        esp_rom_delay_us(10000U);
+    }
+
+    return last_err;
 }
 
 static uint8_t ctrl_output_for_mode(app_mode_t mode)
@@ -100,12 +153,16 @@ static esp_err_t write_ctrl_output(uint8_t output)
 {
     if (s_ctrl_expander == NULL) return ESP_OK;
     if (s_ctrl_output_valid && output == s_last_ctrl_output) return ESP_OK;
+    int64_t now_us = esp_timer_get_time();
+    if (now_us < s_ctrl_next_retry_us) return ESP_ERR_TIMEOUT;
 
     esp_err_t err = write_reg(s_ctrl_expander, PCA9557_REG_OUTPUT, output);
     if (err == ESP_OK) {
         s_last_ctrl_output = output;
         s_ctrl_output_valid = true;
+        s_ctrl_next_retry_us = 0;
     } else {
+        s_ctrl_next_retry_us = now_us + BOARD_IO_ERROR_BACKOFF_US;
         ESP_LOGW(TAG, "ctrl output %02X: %s", output, esp_err_to_name(err));
     }
     return err;
@@ -115,12 +172,16 @@ static esp_err_t write_ui_output(uint8_t output)
 {
     if (s_ui_expander == NULL) return ESP_OK;
     if (s_ui_output_valid && output == s_last_ui_output) return ESP_OK;
+    int64_t now_us = esp_timer_get_time();
+    if (now_us < s_ui_next_retry_us) return ESP_ERR_TIMEOUT;
 
     esp_err_t err = write_reg(s_ui_expander, PCA9557_REG_OUTPUT, output);
     if (err == ESP_OK) {
         s_last_ui_output = output;
         s_ui_output_valid = true;
+        s_ui_next_retry_us = 0;
     } else {
+        s_ui_next_retry_us = now_us + BOARD_IO_ERROR_BACKOFF_US;
         ESP_LOGW(TAG, "ui output %02X: %s", output, esp_err_to_name(err));
     }
     return err;
@@ -151,14 +212,11 @@ static esp_err_t init_ctrl_expander(void)
     s_test_100hz_level = false;
     s_last_mode = APP_MODE_POWER_SUPPLY;
 
-    ESP_RETURN_ON_ERROR(write_reg(s_ctrl_expander,
-                                  PCA9557_REG_OUTPUT,
-                                  BIT_U8(CTRL_EXP_CAN_RS_BIT)),
-                        TAG, "ctrl safe output");
-    ESP_RETURN_ON_ERROR(write_reg(s_ctrl_expander, PCA9557_REG_POLARITY, 0x00U),
-                        TAG, "ctrl polarity");
-    ESP_RETURN_ON_ERROR(write_reg(s_ctrl_expander, PCA9557_REG_CONFIG, 0x00U),
-                        TAG, "ctrl config");
+    ESP_RETURN_ON_ERROR(configure_expander_checked(s_ctrl_expander,
+                                                   BIT_U8(CTRL_EXP_CAN_RS_BIT),
+                                                   0x00U,
+                                                   NULL),
+                        TAG, "ctrl init verify");
     s_last_ctrl_output = BIT_U8(CTRL_EXP_CAN_RS_BIT);
     s_ctrl_output_valid = true;
     return ESP_OK;
@@ -171,21 +229,21 @@ static esp_err_t init_ui_expander(void)
                         TAG, "add ui expander");
 
     s_ui_output_valid = false;
+    s_ui_input_valid = false;
 
-    ESP_RETURN_ON_ERROR(write_reg(s_ui_expander, PCA9557_REG_OUTPUT, 0x00U),
-                        TAG, "ui safe output");
-    ESP_RETURN_ON_ERROR(write_reg(s_ui_expander, PCA9557_REG_POLARITY, 0x00U),
-                        TAG, "ui polarity");
-    ESP_RETURN_ON_ERROR(write_reg(s_ui_expander, PCA9557_REG_CONFIG,
-                                  BIT_U8(UI_EXP_ENCODER_BUTTON_BIT) |
-                                  BIT_U8(UI_EXP_CHANNEL_A_BUTTON_BIT) |
-                                  BIT_U8(UI_EXP_CHANNEL_B_BUTTON_BIT) |
-                                  BIT_U8(UI_EXP_MENU_BUTTON_BIT) |
-                                  BIT_U8(UI_EXP_BUTTON_C_BIT) |
-                                  BIT_U8(UI_EXP_UNUSED_BIT)),
-                        TAG, "ui config");
+    ESP_RETURN_ON_ERROR(configure_expander_checked(s_ui_expander,
+                                                   0x00U,
+                                                   BIT_U8(UI_EXP_ENCODER_BUTTON_BIT) |
+                                                   BIT_U8(UI_EXP_CHANNEL_A_BUTTON_BIT) |
+                                                   BIT_U8(UI_EXP_CHANNEL_B_BUTTON_BIT) |
+                                                   BIT_U8(UI_EXP_MENU_BUTTON_BIT) |
+                                                   BIT_U8(UI_EXP_BUTTON_C_BIT) |
+                                                   BIT_U8(UI_EXP_UNUSED_BIT),
+                                                   &s_last_ui_input),
+                        TAG, "ui init verify");
     s_last_ui_output = 0x00U;
     s_ui_output_valid = true;
+    s_ui_input_valid = true;
 
     return ESP_OK;
 }
@@ -213,6 +271,8 @@ void board_io_i2c_release(void)
     }
     s_ctrl_output_valid = false;
     s_ui_output_valid = false;
+    s_ctrl_next_retry_us = 0;
+    s_ui_next_retry_us = 0;
 }
 
 esp_err_t board_io_read_ui_buttons(bool *encoder_button_high,
@@ -231,6 +291,30 @@ esp_err_t board_io_read_ui_buttons(bool *encoder_button_high,
     return s_ui_input_valid ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
+void board_io_poll_ui_buttons(void)
+{
+    if (s_ui_expander == NULL) {
+        if (init_ui_expander() != ESP_OK) return;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    if (now_us < s_ui_next_retry_us) return;
+
+    uint8_t input = 0xFFU;
+    esp_err_t err = read_reg_timeout(s_ui_expander,
+                                     PCA9557_REG_INPUT,
+                                     &input,
+                                     BOARD_IO_I2C_TIMEOUT_MS);
+    if (err == ESP_OK) {
+        s_last_ui_input = input;
+        s_ui_input_valid = true;
+        s_ui_next_retry_us = 0;
+    } else {
+        s_ui_next_retry_us = now_us + BOARD_IO_ERROR_BACKOFF_US;
+        ESP_LOGW(TAG, "ui input fast: %s", esp_err_to_name(err));
+    }
+}
+
 void board_io_update(const app_state_t *state)
 {
     if (state == NULL) return;
@@ -245,15 +329,7 @@ void board_io_update(const app_state_t *state)
     (void)write_ctrl_output(ctrl_output_for_mode(state->control.mode));
     (void)write_ui_output(ui_output_for_state(state));
 
-    uint8_t input = 0xFFU;
-    if (s_ui_expander == NULL) return;
-    esp_err_t err = read_reg(s_ui_expander, PCA9557_REG_INPUT, &input);
-    if (err == ESP_OK) {
-        s_last_ui_input = input;
-        s_ui_input_valid = true;
-    } else {
-        ESP_LOGW(TAG, "ui input: %s", esp_err_to_name(err));
-    }
+    board_io_poll_ui_buttons();
 }
 
 bool board_io_test_100hz_level(void)
@@ -323,6 +399,10 @@ esp_err_t board_io_init(void)
 }
 
 void board_io_i2c_release(void)
+{
+}
+
+void board_io_poll_ui_buttons(void)
 {
 }
 

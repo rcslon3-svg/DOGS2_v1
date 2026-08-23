@@ -135,7 +135,10 @@
 #define INA238_1_ADDRESS        0x41U
 #define INA238_2_ADDRESS        0x44U
 #define INA238_1_SHUNT_UOHM     100000U
-#define INA238_2_SHUNT_UOHM     10000U
+/* Channel B INA current was 1.144x high against the 8 ohm load sweep.
+ * Use one unconditional scale correction by treating the sense path as
+ * 11.44 mOhm for measurement conversion only. */
+#define INA238_2_SHUNT_UOHM     11440U
 
 /* Channel A's voltage-regulator measurement divider is connected after the
  * current shunt, so INA238 also measures the divider leakage current.  Subtract
@@ -168,19 +171,22 @@
 
 /* Channel A auxiliary LDO reference DAC.
  *
- * MCP4725A0T at 0x60 drives the TPS73801 REF/FB node through 3.6 kOhm.
+ * MCP4725A0T at 0x60 drives the TPS73801 REF/FB node through about 3.325 kOhm
+ * (1.8 kOhm in series with 1.8 kOhm shunted by 10 kOhm).
  * The same node has 20 kOhm to the LDO output and 2 kOhm to ground.
  * The DAC is used to make the LDO output track U2. TPS55289 itself is
- * programmed to U2 + 1.00 V.
+ * programmed above U2 with a small headroom selected by channelA.c.
  */
 #define CHANNEL_A_LDO_DAC_ENABLED       TPS55289_I2C_ENABLED
 #define CHANNEL_A_MCP4725_ADDRESS       0x60U
 #define CHANNEL_A_MCP4725_VDD_MV        3300U
 #define CHANNEL_A_LDO_FB_REF_MV         1210U
-#define CHANNEL_A_LDO_OFFSET_MV         1000U
+#define CHANNEL_A_LDO_HEADROOM_LOW_MV   1000U
+#define CHANNEL_A_LDO_HEADROOM_HIGH_MV  600U
+#define CHANNEL_A_LDO_HEADROOM_SWITCH_MV 19000U
 #define CHANNEL_A_LDO_R_TOP_OHM         20000U
 #define CHANNEL_A_LDO_R_BOTTOM_OHM      2000U
-#define CHANNEL_A_LDO_R_DAC_OHM         3600U
+#define CHANNEL_A_LDO_R_DAC_OHM         3325U
 
 /* Hidden output-voltage correction.
  *
@@ -191,7 +197,7 @@
 #define OUTPUT_VOLTAGE_TRIM_ENABLED     1
 #define OUTPUT_VOLTAGE_TRIM_MAX_MV      300
 #define OUTPUT_VOLTAGE_TRIM_DEADBAND_MV 15
-#define OUTPUT_VOLTAGE_TRIM_STEP_MV     2
+#define OUTPUT_VOLTAGE_TRIM_STEP_MV     10
 #define OUTPUT_VOLTAGE_TRIM_GAIN_DIV    16
 #define CHANNEL_A_LOAD_COMP_MOHM        30
 #define CHANNEL_B_LOAD_COMP_MOHM        30
@@ -304,6 +310,8 @@
 #define OPEN_TEST_DELTA_MV      70U
 #define EXPECTED_OPEN_TEST_MV   304U
 #define BIAS_RESISTOR_OHM       300000U
+#define PROBE_SYNC_SOURCE_OHM   330000U
+#define PROBE_SYNC_OPEN_SPAN_MV 176U
 #define ANALOG_SAMPLE_PERIOD_MS 10U
 #define ANALOG_WINDOW_SAMPLES   10U
 #define ANALOG_ADC_READS        16U
@@ -332,5 +340,5 @@
  */
 #define EVENT_SINGLE_EDGE_MAX_HZ 1.0f
 #define UI_PERIOD_MS            50U
-#define TELEMETRY_PERIOD_MS     50U
+#define TELEMETRY_PERIOD_MS     100U
 #define BLUETOOTH_DEVICE_NAME   "DOGS2_A001"

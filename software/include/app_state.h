@@ -8,12 +8,12 @@
 
 typedef enum {
     APP_MODE_POWER_SUPPLY = 0,
+    APP_MODE_1WIRE,
     APP_MODE_GENERATOR,
     APP_MODE_UART,
     APP_MODE_LIN,
-    APP_MODE_1WIRE,
-    APP_MODE_RS485,
     APP_MODE_CAN,
+    APP_MODE_RS485,
     APP_MODE_I2C,
     APP_MODE_I2C_MASTER,
     APP_MODE_SETTING,
@@ -40,6 +40,10 @@ typedef enum {
     CONTROL_SELECT_LIN_MASK = 16,
     CONTROL_SELECT_CAN_MASK = 17,
     CONTROL_SELECT_I2C_MASK = 18,
+    CONTROL_SELECT_CURRENT_RATE = 19,
+    CONTROL_SELECT_CURRENT_SCALE = 20,
+    CONTROL_SELECT_CURRENT_CHANNEL = 21,
+    CONTROL_SELECT_CALIBRATION = 22,
 } control_select_t;
 
 typedef enum {
@@ -124,6 +128,7 @@ typedef struct {
     uint8_t address;
     uint32_t shunt_uohm;
     int32_t shunt_uv;
+    int64_t current_ua;
     int32_t current_ma;
     uint32_t bus_mv;
     int32_t temperature_mc;
@@ -190,6 +195,9 @@ typedef struct {
     uint32_t lin_baud;
     uint32_t rs485_baud;
     uint32_t can_bitrate;
+    uint8_t current_graph_decimation;
+    uint16_t current_graph_scale_ma;
+    uint8_t current_graph_channels;
     char lin_mask[3];
     char can_mask[4];
     char i2c_mask[3];
@@ -203,6 +211,16 @@ typedef struct {
     uint8_t overheat_c;
     uint16_t overpower_w;
     uint8_t volume_percent;
+    bool calibration_on;
+    bool calibration_running;
+    bool calibration_confirm;
+    bool calibration_confirm_ok;
+    bool calibration_done;
+    char calibration_channel;
+    uint16_t calibration_target_mv;
+    uint32_t calibration_measured_mv;
+    int64_t calibration_measured_current_ua;
+    uint32_t calibration_sample_count;
     bool channel_a_enabled;
     bool channel_b_enabled;
     uint8_t selected_value;

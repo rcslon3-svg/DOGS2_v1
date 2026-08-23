@@ -6,6 +6,7 @@
 
 esp_err_t board_io_init(void);
 void board_io_i2c_release(void);
+void board_io_poll_ui_buttons(void);
 void board_io_update(const app_state_t *state);
 esp_err_t board_io_toggle_test_100hz(const app_state_t *state);
 esp_err_t board_io_set_test_100hz(const app_state_t *state, bool high);

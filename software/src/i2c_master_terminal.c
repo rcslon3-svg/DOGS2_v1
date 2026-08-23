@@ -26,8 +26,6 @@ static uint32_t s_packets;
 static uint32_t s_errors;
 static volatile app_mode_t s_active_mode = APP_MODE_POWER_SUPPLY;
 static app_mode_t s_requested_mode = APP_MODE_POWER_SUPPLY;
-static bool s_bt_was_connected;
-static bool s_hint_sent;
 
 static void send_line(const char *line)
 {
@@ -362,27 +360,6 @@ static void input_task(void *argument)
     }
 }
 
-static void hint_update(app_mode_t mode)
-{
-    bool bt_connected = bluetooth_spp_connected();
-    bool bt_connected_now = bt_connected && !s_bt_was_connected;
-    bool entering = mode == APP_MODE_I2C_MASTER && s_active_mode != APP_MODE_I2C_MASTER;
-
-    if (mode != APP_MODE_I2C_MASTER || !bt_connected) {
-        s_hint_sent = false;
-    }
-
-    if (mode == APP_MODE_I2C_MASTER && bt_connected && !s_hint_sent &&
-        (entering || bt_connected_now)) {
-        static const char hint[] =
-            "[I2C HINT] S | R <addr> <reg> <len> | W <addr> <reg> <data...> | RR <addr> <len> | WW <addr> <data...>\r\n";
-        bluetooth_spp_write(hint, sizeof(hint) - 1U);
-        s_hint_sent = true;
-    }
-
-    s_bt_was_connected = bt_connected;
-}
-
 esp_err_t i2c_master_terminal_init(void)
 {
     esp_err_t err = i2c_aux_bus_init();
@@ -395,7 +372,6 @@ esp_err_t i2c_master_terminal_init(void)
 
 void i2c_master_terminal_configure(app_mode_t mode)
 {
-    hint_update(mode);
     if (mode != s_requested_mode) {
         bool was_master = s_active_mode == APP_MODE_I2C_MASTER;
         s_requested_mode = mode;

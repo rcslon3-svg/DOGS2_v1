@@ -6,6 +6,8 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
+#include "calibration.h"
+#include "current_graph.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -38,6 +40,7 @@
 #define POWER_CHANNEL_FRAME_WIDTH 238
 #define POWER_CHANNEL_INNER_X 8
 #define POWER_CHANNEL_INNER_RIGHT 242
+#define DISPLAY_CALIBRATION_SAMPLE_COUNT 32U
 #define POWER_CURRENT_RIGHT 238
 #define POWER_SIDE_FRAME_X 248
 #define POWER_SIDE_FRAME_WIDTH 66
@@ -48,6 +51,13 @@
 #define INTERFACE_SIDE_INNER_X (INTERFACE_SIDE_FRAME_X + 2)
 #define INTERFACE_SIDE_INNER_RIGHT \
     (INTERFACE_SIDE_FRAME_X + INTERFACE_SIDE_FRAME_WIDTH - 2)
+#define CURRENT_GRAPH_X 10
+#define CURRENT_GRAPH_Y 30
+#define CURRENT_GRAPH_W 258
+#define CURRENT_GRAPH_H 90
+#define CURRENT_GRAPH_SAMPLES_PER_DIV 20
+#define CURRENT_GRAPH_CELLS_Y 5
+#define CURRENT_GRAPH_BASE_SAMPLE_MS 100U
 #define TFT_BACKLIGHT_LEDC_MODE LEDC_HIGH_SPEED_MODE
 #define TFT_BACKLIGHT_LEDC_TIMER LEDC_TIMER_3
 #define TFT_BACKLIGHT_LEDC_CHANNEL LEDC_CHANNEL_7
@@ -57,9 +67,13 @@
 #define TFT_BACKLIGHT_FADE_MS 800U
 #define TFT_BACKLIGHT_FADE_STEPS 32U
 #define TFT_SPLASH_VISIBLE_MS 2000U
+#define DISPLAY_BUFFER_ROWS 40U
+#define DISPLAY_CURRENT_AVG_SAMPLES 3U
 
 static spi_device_handle_t s_tft;
 static const char *TAG = "display";
+static int s_graph_slice_y;
+static int s_graph_slice_h;
 
 /*
  * Text is composed in RAM before it is sent to the TFT.  Besides allowing
@@ -68,7 +82,7 @@ static const char *TAG = "display";
  * font visibly blink.  A 320 x 40 buffer costs 25.6 kB but each completed
  * line now reaches the display as one continuous image.
  */
-static uint16_t s_text_buffer[TFT_WIDTH * 40];
+static uint16_t s_text_buffer[TFT_WIDTH * DISPLAY_BUFFER_ROWS];
 static uint8_t s_fill_block[4096];
 
 /* Match the pixel polarity already used by the working splash bitmap. */
@@ -737,14 +751,38 @@ static void append_format_colored(char *line,
  */
 static uint8_t measured_current_decimals(char channel)
 {
-    return channel == 'A' ? 5U : 4U;
+    (void)channel;
+    return 5U;
 }
+
+typedef struct {
+    int64_t samples[DISPLAY_CURRENT_AVG_SAMPLES];
+    int64_t sum;
+    uint8_t next;
+    uint8_t count;
+    bool initialized;
+} display_current_filter_t;
+
+static display_current_filter_t s_display_current_filter[2];
+
+static int font_max_digit_width(const smooth_font_t *font);
+static void buffer_draw_fixed_current_char(int x,
+                                           int y,
+                                           int slot_width,
+                                           char c,
+                                           const smooth_font_t *font,
+                                           uint16_t fg,
+                                           uint16_t bg,
+                                           int buffer_height);
 
 static int64_t measured_current_ua(char channel, const app_ina238_channel_t *measurement)
 {
     if (!measurement->valid || measurement->shunt_uohm == 0U) return 0;
-    int64_t current_ua = ((int64_t)measurement->shunt_uv * 1000000LL) /
-                         (int64_t)measurement->shunt_uohm;
+    int64_t current_ua = measurement->current_ua;
+    uint8_t cal_channel = channel == 'A' ? CALIBRATION_CHANNEL_A : CALIBRATION_CHANNEL_B;
+    if (calibration_current_available(cal_channel)) {
+        return calibration_correct_current_ua(cal_channel, measurement->bus_mv, current_ua);
+    }
     if (channel == 'A') {
         current_ua -= ((int64_t)measurement->bus_mv * CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_NUM +
                        CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_DEN / 2LL) /
@@ -753,12 +791,41 @@ static int64_t measured_current_ua(char channel, const app_ina238_channel_t *mea
     return current_ua;
 }
 
+static int64_t display_filtered_current_ua(char channel,
+                                           const app_ina238_channel_t *measurement,
+                                           int64_t current_ua)
+{
+    uint8_t index = channel == 'A' ? 0U : 1U;
+    display_current_filter_t *filter = &s_display_current_filter[index];
+
+    if (!measurement->valid) {
+        memset(filter, 0, sizeof(*filter));
+        return 0;
+    }
+
+    if (filter->count < DISPLAY_CURRENT_AVG_SAMPLES) {
+        filter->samples[filter->next] = current_ua;
+        filter->sum += current_ua;
+        ++filter->count;
+    } else {
+        filter->sum -= filter->samples[filter->next];
+        filter->samples[filter->next] = current_ua;
+        filter->sum += current_ua;
+    }
+    filter->next = (uint8_t)((filter->next + 1U) % DISPLAY_CURRENT_AVG_SAMPLES);
+    filter->initialized = true;
+
+    if (filter->sum >= 0) return (filter->sum + filter->count / 2U) / filter->count;
+    return -((-filter->sum + filter->count / 2U) / filter->count);
+}
+
 static void format_measured_current(char *out,
                                     size_t size,
                                     char channel,
                                     const app_ina238_channel_t *measurement)
 {
     int64_t current_ua = measured_current_ua(channel, measurement);
+    current_ua = display_filtered_current_ua(channel, measurement, current_ua);
     if (current_ua < 0) current_ua = 0;
     uint8_t decimals = measured_current_decimals(channel);
     int64_t scale = 1;
@@ -864,7 +931,7 @@ static void draw_channel_actual_line(int y,
                      channel_enabled ? COLOR_GREEN : COLOR_GRAY, COLOR_PANEL, height);
 
     size_t current_len = strlen(current);
-    size_t small_digits = measurement->valid ? (channel == 'A' ? 2U : 1U) : 0U;
+    size_t small_digits = measurement->valid ? 2U : 0U;
     if (small_digits > current_len) small_digits = 0U;
     char current_main[32];
     char current_tail[4] = "";
@@ -872,28 +939,60 @@ static void draw_channel_actual_line(int y,
     memcpy(current_main, current, main_len);
     current_main[main_len] = '\0';
     if (small_digits != 0U) snprintf(current_tail, sizeof(current_tail), "%s", current + main_len);
-    int current_group_width = text_width(current_main, &instrument_30) +
-                              text_width(current_tail, &instrument_18) + 1 +
-                              text_width("A", &instrument_18);
-    int current_x = POWER_CURRENT_RIGHT - current_group_width;
     uint16_t current_fg = (cc_active && channel_enabled) ? channel_fg : value_color;
     uint16_t current_bg = (cc_active && channel_enabled) ? channel_bg : COLOR_PANEL;
+
+    int digit30_width = font_max_digit_width(&instrument_30);
+    int dot30_width = text_width(".", &instrument_30);
+    int digit18_width = font_max_digit_width(&instrument_18);
+    int main_slots[5] = {
+        digit30_width,
+        dot30_width,
+        digit30_width,
+        digit30_width,
+        digit30_width,
+    };
+    int fixed_current_width = main_slots[0] + main_slots[1] + main_slots[2] +
+                              main_slots[3] + main_slots[4] +
+                              digit18_width * 2;
+    int unit_gap = 1;
+    int current_group_width = fixed_current_width + unit_gap + text_width("A", &instrument_18);
+    int current_x = POWER_CURRENT_RIGHT - current_group_width;
+    int tail_x = current_x + main_slots[0] + main_slots[1] + main_slots[2] +
+                 main_slots[3] + main_slots[4];
     if (cc_active && channel_enabled) {
-        int current_width = text_width(current_main, &instrument_30) +
-                            text_width(current_tail, &instrument_18);
-        buffer_fill_round_rect(current_x - 2, 0, current_width + 4,
+        buffer_fill_round_rect(current_x - 2, 0, fixed_current_width + 4,
                                badge_height, 3, height, current_bg);
     }
-    buffer_draw_text(current_x, 0, current_main, &instrument_30,
-                     current_fg, current_bg, height);
-    int tail_x = current_x + text_width(current_main, &instrument_30);
+
+    if (measurement->valid && main_len == 5U && strlen(current_tail) == 2U) {
+        int x = current_x;
+        for (size_t i = 0U; i < 5U; ++i) {
+            buffer_draw_fixed_current_char(x, 0, main_slots[i], current_main[i],
+                                           &instrument_30, current_fg, current_bg, height);
+            x += main_slots[i];
+        }
+    } else {
+        buffer_draw_text(current_x, 0, current_main, &instrument_30,
+                         current_fg, current_bg, height);
+        tail_x = current_x + text_width(current_main, &instrument_30);
+    }
+
     const smooth_glyph_t *small_zero =
         &instrument_18.glyphs[(uint8_t)'0' - instrument_18.first_char];
     int tail_y = (main_zero->y_offset + main_zero->height) -
                  (small_zero->y_offset + small_zero->height);
-    buffer_draw_text(tail_x, tail_y, current_tail, &instrument_18,
-                     current_fg, current_bg, height);
-    int unit_a_x = tail_x + text_width(current_tail, &instrument_18) + 1;
+    if (measurement->valid && strlen(current_tail) == 2U) {
+        buffer_draw_fixed_current_char(tail_x, tail_y, digit18_width, current_tail[0],
+                                       &instrument_18, current_fg, current_bg, height);
+        buffer_draw_fixed_current_char(tail_x + digit18_width, tail_y, digit18_width,
+                                       current_tail[1], &instrument_18,
+                                       current_fg, current_bg, height);
+    } else {
+        buffer_draw_text(tail_x, tail_y, current_tail, &instrument_18,
+                         current_fg, current_bg, height);
+    }
+    int unit_a_x = current_x + fixed_current_width + unit_gap;
     const smooth_glyph_t *small_a =
         &instrument_18.glyphs[(uint8_t)'A' - instrument_18.first_char];
     int unit_a_y = (main_zero->y_offset + main_zero->height) -
@@ -929,7 +1028,8 @@ static void draw_channel_set_line(int y,
                                   uint8_t current_select,
                                   uint8_t selected,
                                   uint8_t digit,
-                                  bool edit_blink_on)
+                                  bool edit_blink_on,
+                                  bool cc_active)
 {
     char line[64] = "";
     uint16_t fg[64];
@@ -951,11 +1051,14 @@ static void draw_channel_set_line(int y,
     format_current(current, sizeof(current), target_ma);
     append_colored(line, fg, bg, &pos, current, COLOR_YELLOW);
     append_colored(line, fg, bg, &pos, "A", COLOR_CYAN);
+    append_colored(line, fg, bg, &pos, "  ", COLOR_GRAY);
+    append_colored(line, fg, bg, &pos, cc_active ? "CC" : "CV",
+                   cc_active ? COLOR_RED : COLOR_BLUE);
 
     if (selected == voltage_select) {
         if (digit == CONTROL_DIGIT_WHOLE) {
             mark_range(fg, bg, voltage_start, strlen(voltage), COLOR_BLACK, COLOR_YELLOW);
-        } else {
+        } else if (edit_blink_on) {
             mark_range(fg, bg, voltage_start, strlen(voltage), COLOR_YELLOW, COLOR_BLACK);
             mark_range(fg, bg, voltage_start + editable_digit_offset(voltage, digit),
                        1U, COLOR_BLACK, COLOR_YELLOW);
@@ -1072,7 +1175,7 @@ static void draw_generator_duty_line(const app_state_t *s)
     if (s->control.selected_value == CONTROL_SELECT_GEN_DUTY) {
         if (s->control.selected_digit == CONTROL_DIGIT_WHOLE) {
             mark_range(fg, bg, duty_start, strlen(duty), COLOR_BLACK, COLOR_YELLOW);
-        } else {
+        } else if (((esp_timer_get_time() / 500000LL) & 1LL) == 0LL) {
             mark_range(fg, bg,
                        duty_start + editable_digit_offset(duty, s->control.selected_digit),
                        1U,
@@ -1080,7 +1183,11 @@ static void draw_generator_duty_line(const app_state_t *s)
                        COLOR_YELLOW);
         }
     } else if (s->control.selected_value == CONTROL_SELECT_GEN_ON) {
-        mark_range(fg, bg, on_start, strlen(on_value), COLOR_BLACK, COLOR_YELLOW);
+        bool blink_on = s->control.selected_digit == CONTROL_DIGIT_WHOLE ||
+                        ((esp_timer_get_time() / 500000LL) & 1LL) == 0LL;
+        if (blink_on) {
+            mark_range(fg, bg, on_start, strlen(on_value), COLOR_BLACK, COLOR_YELLOW);
+        }
     }
 
     draw_rich_text_on_panel(12, 72, line, &instrument_30, fg, bg,
@@ -1106,7 +1213,7 @@ static void draw_generator_frequency_line(const app_state_t *s)
     if (s->control.selected_value == CONTROL_SELECT_GEN_FREQ) {
         if (s->control.selected_digit == CONTROL_DIGIT_WHOLE) {
             mark_range(fg, bg, value_start, strlen(value), COLOR_BLACK, COLOR_YELLOW);
-        } else {
+        } else if (((esp_timer_get_time() / 500000LL) & 1LL) == 0LL) {
             mark_range(fg, bg,
                        value_start + editable_digit_offset(value, s->control.selected_digit),
                        1U, COLOR_BLACK, COLOR_YELLOW);
@@ -1238,7 +1345,11 @@ static void draw_serial_header(const app_state_t *s,
     append_colored(line, fg, bg, &pos, value, COLOR_YELLOW);
 
     if (s->control.selected_value == select) {
-        mark_range(fg, bg, baud_start, strlen(value), COLOR_BLACK, COLOR_YELLOW);
+        bool blink_on = s->control.selected_digit == CONTROL_DIGIT_WHOLE ||
+                        ((esp_timer_get_time() / 500000LL) & 1LL) == 0LL;
+        if (blink_on) {
+            mark_range(fg, bg, baud_start, strlen(value), COLOR_BLACK, COLOR_YELLOW);
+        }
     }
 
     draw_rich_text_on_panel_clipped(10, 4, line, &instrument_18, fg, bg,
@@ -1310,7 +1421,8 @@ static void draw_mask_line(int y,
     if (s->control.selected_value == select) {
         if (s->control.selected_digit == CONTROL_DIGIT_WHOLE) {
             mark_range(fg, bg, value_start, strlen(mask), COLOR_BLACK, COLOR_YELLOW);
-        } else if (s->control.selected_digit < strlen(mask)) {
+        } else if (s->control.selected_digit < strlen(mask) &&
+                   ((esp_timer_get_time() / 500000LL) & 1LL) == 0LL) {
             mark_range(fg, bg, value_start + s->control.selected_digit, 1U, COLOR_BLACK, COLOR_YELLOW);
         }
     }
@@ -1377,7 +1489,8 @@ static void draw_i2c_sniffer_screen(const app_state_t *s, bool draw_frame)
         if (s->control.selected_digit == CONTROL_DIGIT_WHOLE) {
             mark_range(fg, bg, mask_start, strlen(s->control.i2c_mask),
                        COLOR_BLACK, COLOR_YELLOW);
-        } else if (s->control.selected_digit < strlen(s->control.i2c_mask)) {
+        } else if (s->control.selected_digit < strlen(s->control.i2c_mask) &&
+                   ((esp_timer_get_time() / 500000LL) & 1LL) == 0LL) {
             mark_range(fg, bg, mask_start + s->control.selected_digit, 1U,
                        COLOR_BLACK, COLOR_YELLOW);
         }
@@ -1424,6 +1537,12 @@ static void draw_can_screen(const app_state_t *s, bool draw_frame)
     static char previous_header[64];
     static char previous_status[64];
     static char previous_rx[3][I2C_DISPLAY_CHARS + 1U];
+    static bool previous_header_selected;
+    static uint8_t previous_header_digit;
+    static uint8_t previous_header_blink;
+    static bool previous_status_selected;
+    static uint8_t previous_status_digit;
+    static uint8_t previous_status_blink;
     char line[64] = "";
     char value[16];
     uint16_t fg[64];
@@ -1431,14 +1550,18 @@ static void draw_can_screen(const app_state_t *s, bool draw_frame)
     size_t pos = 0U;
     size_t value_start;
     size_t mask_start;
-    const char *tx_text = "---";
-    uint16_t tx_color = COLOR_GRAY;
 
     if (draw_frame) {
         draw_masked_serial_frame("H", "L");
         previous_header[0] = '\0';
         previous_status[0] = '\0';
         memset(previous_rx, 0, sizeof(previous_rx));
+        previous_header_selected = false;
+        previous_header_digit = 0xFFU;
+        previous_header_blink = 0xFFU;
+        previous_status_selected = false;
+        previous_status_digit = 0xFFU;
+        previous_status_blink = 0xFFU;
     }
 
     snprintf(value, sizeof(value), "%lu", (unsigned long)(s->control.can_bitrate / 1000U));
@@ -1447,15 +1570,29 @@ static void draw_can_screen(const app_state_t *s, bool draw_frame)
     value_start = pos;
     append_colored(line, fg, bg, &pos, value, COLOR_YELLOW);
     append_colored(line, fg, bg, &pos, " KBIT", COLOR_GREEN);
-    if (s->control.selected_value == CONTROL_SELECT_CAN_BITRATE) {
-        mark_range(fg, bg, value_start, strlen(value), COLOR_BLACK, COLOR_YELLOW);
+    bool header_selected = s->control.selected_value == CONTROL_SELECT_CAN_BITRATE;
+    uint8_t header_blink = (uint8_t)((esp_timer_get_time() / 500000LL) & 1LL);
+    if (header_selected) {
+        bool blink_on = s->control.selected_digit == CONTROL_DIGIT_WHOLE ||
+                        header_blink == 0U;
+        if (blink_on) {
+            mark_range(fg, bg, value_start, strlen(value), COLOR_BLACK, COLOR_YELLOW);
+        }
     }
-    if (strcmp(previous_header, line) != 0) {
+    if (strcmp(previous_header, line) != 0 ||
+        previous_header_selected != header_selected ||
+        previous_header_digit != s->control.selected_digit ||
+        (header_selected &&
+         s->control.selected_digit != CONTROL_DIGIT_WHOLE &&
+         previous_header_blink != header_blink)) {
         fill_rect(8, 3, INTERFACE_MAIN_FRAME_WIDTH - 4, 21, COLOR_PANEL);
         draw_rich_text_on_panel_clipped(10, 4, line, &instrument_18, fg, bg,
                                         COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
                                         3, 24);
         snprintf(previous_header, sizeof(previous_header), "%s", line);
+        previous_header_selected = header_selected;
+        previous_header_digit = s->control.selected_digit;
+        previous_header_blink = header_blink;
     }
 
     line[0] = '\0';
@@ -1465,28 +1602,34 @@ static void draw_can_screen(const app_state_t *s, bool draw_frame)
     mask_start = pos;
     append_colored(line, fg, bg, &pos, s->control.can_mask, COLOR_YELLOW);
     append_colored(line, fg, bg, &pos, " TX ", COLOR_LABEL);
-    switch (s->can.tx_result) {
-        case 1U: tx_text = "OK"; tx_color = COLOR_GREEN; break;
-        case 2U: tx_text = "BUSY"; tx_color = COLOR_YELLOW; break;
-        case 3U: tx_text = "ERR"; tx_color = COLOR_RED; break;
-        default: break;
-    }
-    append_colored(line, fg, bg, &pos, tx_text, tx_color);
+    append_format_colored(line, fg, bg, &pos, COLOR_YELLOW, "%lu",
+                          (unsigned long)s->can.tx_queue_msgs);
+    bool status_selected = s->control.selected_value == CONTROL_SELECT_CAN_MASK;
+    uint8_t status_blink = (uint8_t)((esp_timer_get_time() / 500000LL) & 1LL);
     if (s->control.selected_value == CONTROL_SELECT_CAN_MASK) {
         if (s->control.selected_digit == CONTROL_DIGIT_WHOLE) {
             mark_range(fg, bg, mask_start, strlen(s->control.can_mask),
                        COLOR_BLACK, COLOR_YELLOW);
-        } else if (s->control.selected_digit < strlen(s->control.can_mask)) {
+        } else if (s->control.selected_digit < strlen(s->control.can_mask) &&
+                   status_blink == 0U) {
             mark_range(fg, bg, mask_start + s->control.selected_digit, 1U,
                        COLOR_BLACK, COLOR_YELLOW);
         }
     }
-    if (strcmp(previous_status, line) != 0) {
+    if (strcmp(previous_status, line) != 0 ||
+        previous_status_selected != status_selected ||
+        previous_status_digit != s->control.selected_digit ||
+        (status_selected &&
+         s->control.selected_digit != CONTROL_DIGIT_WHOLE &&
+         previous_status_blink != status_blink)) {
         fill_rect(8, 27, INTERFACE_MAIN_FRAME_WIDTH - 4, 21, COLOR_PANEL);
         draw_rich_text_on_panel_clipped(10, 27, line, &instrument_18, fg, bg,
                                         COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
                                         25, 51);
         snprintf(previous_status, sizeof(previous_status), "%s", line);
+        previous_status_selected = status_selected;
+        previous_status_digit = s->control.selected_digit;
+        previous_status_blink = status_blink;
     }
 
     const int rx_y[3] = {54, 76, 98};
@@ -1500,9 +1643,14 @@ static void draw_can_screen(const app_state_t *s, bool draw_frame)
     draw_bottom_actuals_to(s, INTERFACE_MAIN_INNER_RIGHT);
 }
 
-static void draw_setting_line(int y,
+static void draw_setting_line(int x,
+                              int y,
+                              int panel_left,
+                              int panel_right,
                               const char *label,
                               const char *value,
+                              const char *suffix,
+                              uint16_t suffix_color,
                               uint8_t select,
                               const app_state_t *s,
                               int clip_top,
@@ -1519,12 +1667,22 @@ static void draw_setting_line(int y,
     append_colored(line, fg, bg, &pos, " ", COLOR_LABEL);
     value_start = pos;
     append_colored(line, fg, bg, &pos, value, COLOR_YELLOW);
+    if (suffix != NULL && suffix[0] != '\0') {
+        append_colored(line, fg, bg, &pos, suffix, suffix_color);
+    }
 
     if (s->control.selected_value == select) {
-        if (s->control.selected_digit == CONTROL_DIGIT_WHOLE ||
-            select == CONTROL_SELECT_OVERCURRENT) {
-            mark_range(fg, bg, value_start, strlen(value), COLOR_BLACK, COLOR_YELLOW);
-        } else {
+        bool blink_on = ((esp_timer_get_time() / 500000LL) & 1LL) == 0LL;
+        size_t value_length = strlen(value);
+        if (s->control.selected_digit == CONTROL_DIGIT_WHOLE) {
+            mark_range(fg, bg, value_start, value_length, COLOR_BLACK, COLOR_YELLOW);
+        } else if ((select == CONTROL_SELECT_OVERCURRENT ||
+                    select == CONTROL_SELECT_CALIBRATION ||
+                    select == CONTROL_SELECT_OVERHEAT ||
+                    select == CONTROL_SELECT_OVERPOWER ||
+                    select == CONTROL_SELECT_VOLUME) && blink_on) {
+            mark_range(fg, bg, value_start, value_length, COLOR_BLACK, COLOR_YELLOW);
+        } else if (blink_on) {
             mark_range(fg,
                        bg,
                        value_start + editable_digit_offset(value, s->control.selected_digit),
@@ -1534,73 +1692,552 @@ static void draw_setting_line(int y,
         }
     }
 
-    draw_rich_text_on_panel_clipped(12, y, line, &instrument_18, fg, bg,
-                                    COLOR_PANEL, 8, TFT_WIDTH - 8,
+    draw_rich_text_on_panel_clipped(x, y, line, &instrument_18, fg, bg,
+                                    COLOR_PANEL, panel_left, panel_right,
                                     clip_top, clip_bottom);
+}
+
+static void format_calibration_current(char *out, size_t size, int64_t current_ua)
+{
+    bool negative = current_ua < 0;
+    if (negative) current_ua = -current_ua;
+    int64_t ma_x1000 = current_ua;
+    snprintf(out,
+             size,
+             "%s%lld.%03lldmA",
+             negative ? "-" : "",
+             (long long)(ma_x1000 / 1000LL),
+             (long long)(ma_x1000 % 1000LL));
+}
+
+static void draw_plain_text_on_bg(int x,
+                                  int y,
+                                  const char *text,
+                                  const smooth_font_t *font,
+                                  uint16_t fg_color,
+                                  uint16_t bg_color,
+                                  int panel_left,
+                                  int panel_right,
+                                  int clip_top,
+                                  int clip_bottom)
+{
+    char line[48];
+    uint16_t fg[48];
+    uint16_t bg[48];
+    size_t pos = 0U;
+
+    snprintf(line, sizeof(line), "%s", text);
+    fill_text_colors(fg, bg, sizeof(fg) / sizeof(fg[0]));
+    (void)pos;
+    for (size_t i = 0U; i < strlen(line) && i < sizeof(fg) / sizeof(fg[0]); ++i) {
+        fg[i] = fg_color;
+        bg[i] = bg_color;
+    }
+    draw_rich_text_on_panel_clipped(x, y, line, font, fg, bg,
+                                    bg_color, panel_left, panel_right,
+                                    clip_top, clip_bottom);
+}
+
+static void draw_choice_button(int x, int y, const char *text, bool selected)
+{
+    uint16_t bg = selected ? COLOR_YELLOW : COLOR_PANEL;
+    uint16_t fg = selected ? COLOR_BLACK : COLOR_LABEL;
+    uint16_t outline = selected ? COLOR_YELLOW : COLOR_GRAY;
+    fill_round_rect(x, y, 104, 32, 4, bg);
+    fill_rect(x, y, 104, 2, outline);
+    fill_rect(x, y + 30, 104, 2, outline);
+    fill_rect(x, y, 2, 32, outline);
+    fill_rect(x + 102, y, 2, 32, outline);
+    int tx = x + (104 - text_width(text, &instrument_18)) / 2;
+    draw_plain_text_on_bg(tx, y + 7, text, &instrument_18, fg, bg,
+                          x, x + 104, y, y + 32);
+}
+
+static void draw_calibration_confirm_screen(const app_state_t *s, bool draw_frame)
+{
+    if (draw_frame) {
+        fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
+        draw_text(8, 5, "CALIBRATION", &instrument_18, COLOR_CYAN);
+        fill_round_rect(8, 34, 304, 70, 4, COLOR_PANEL);
+        draw_panel_outline(6, 32, 308, 74, COLOR_RED);
+        int warning_x = 8 + (304 - text_width("DISCONNECT ALL OUTPUTS", &instrument_18)) / 2;
+        draw_plain_text_on_bg(warning_x, 63, "DISCONNECT ALL OUTPUTS", &instrument_18, COLOR_RED,
+                              COLOR_PANEL, 8, 312, 34, 104);
+    }
+    draw_choice_button(36, 126, "OK", s->control.calibration_confirm_ok);
+    draw_choice_button(180, 126, "CANCEL", !s->control.calibration_confirm_ok);
+}
+
+static void draw_calibration_progress_screen(const app_state_t *s, bool draw_frame)
+{
+    static char previous_channel_line[40];
+    static char previous_set_line[40];
+    static char previous_meas_line[40];
+    static char previous_current_line[40];
+    static char previous_count_line[40];
+    char line[40];
+    char current[24];
+    char channel = s->control.calibration_channel == 'B' ? 'B' : 'A';
+
+    if (draw_frame) {
+        fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
+        draw_text(8, 5, "CALIBRATION", &instrument_18, COLOR_CYAN);
+        fill_rect(8, 31, 304, 31, COLOR_BLACK);
+        fill_round_rect(8, 70, 304, 90, 4, COLOR_PANEL);
+        draw_panel_outline(6, 68, 308, 94, COLOR_CYAN);
+        previous_channel_line[0] = '\0';
+        previous_set_line[0] = '\0';
+        previous_meas_line[0] = '\0';
+        previous_current_line[0] = '\0';
+        previous_count_line[0] = '\0';
+    }
+
+    snprintf(line, sizeof(line), "CHANNEL %c", channel);
+    if (strcmp(previous_channel_line, line) != 0) {
+        fill_rect(8, 31, 304, 31, COLOR_BLACK);
+        draw_text(8, 31, line, &instrument_30, channel == 'A' ? COLOR_CYAN : COLOR_PURPLE);
+        snprintf(previous_channel_line, sizeof(previous_channel_line), "%s", line);
+    }
+
+    snprintf(line,
+             sizeof(line),
+             "SET %u.%02uV",
+             (unsigned)(s->control.calibration_target_mv / 1000U),
+             (unsigned)((s->control.calibration_target_mv % 1000U) / 10U));
+    if (strcmp(previous_set_line, line) != 0) {
+        draw_plain_text_on_bg(16, 80, line, &instrument_18, COLOR_LABEL,
+                              COLOR_PANEL, 8, 312, 70, 160);
+        snprintf(previous_set_line, sizeof(previous_set_line), "%s", line);
+    }
+
+    snprintf(line,
+             sizeof(line),
+             "MEAS %lu.%02luV",
+             (unsigned long)(s->control.calibration_measured_mv / 1000U),
+             (unsigned long)((s->control.calibration_measured_mv % 1000U) / 10U));
+    if (strcmp(previous_meas_line, line) != 0) {
+        draw_plain_text_on_bg(16, 104, line, &instrument_18, COLOR_YELLOW,
+                              COLOR_PANEL, 8, 312, 70, 160);
+        snprintf(previous_meas_line, sizeof(previous_meas_line), "%s", line);
+    }
+
+    format_calibration_current(current,
+                               sizeof(current),
+                               s->control.calibration_measured_current_ua);
+    snprintf(line, sizeof(line), "I %s", current);
+    if (strcmp(previous_current_line, line) != 0) {
+        draw_plain_text_on_bg(16, 128, line, &instrument_18, COLOR_LABEL,
+                              COLOR_PANEL, 8, 312, 70, 160);
+        snprintf(previous_current_line, sizeof(previous_current_line), "%s", line);
+    }
+
+    snprintf(line,
+             sizeof(line),
+             "%lu/%u",
+             (unsigned long)s->control.calibration_sample_count,
+             (unsigned)DISPLAY_CALIBRATION_SAMPLE_COUNT);
+    if (strcmp(previous_count_line, line) != 0) {
+        draw_plain_text_on_bg(242, 128, line, &instrument_18, COLOR_GRAY,
+                              COLOR_PANEL, 8, 312, 70, 160);
+        snprintf(previous_count_line, sizeof(previous_count_line), "%s", line);
+    }
+}
+
+static int font_max_digit_width(const smooth_font_t *font)
+{
+    int max_width = 0;
+    for (char c = '0'; c <= '9'; ++c) {
+        char text[2] = {c, '\0'};
+        int width = text_width(text, font);
+        if (width > max_width) max_width = width;
+    }
+    return max_width;
+}
+
+static void buffer_draw_fixed_current_char(int x,
+                                           int y,
+                                           int slot_width,
+                                           char c,
+                                           const smooth_font_t *font,
+                                           uint16_t fg,
+                                           uint16_t bg,
+                                           int buffer_height)
+{
+    char text[2] = {c, '\0'};
+    int width = text_width(text, font);
+    int char_x = x + (slot_width - width) / 2;
+    buffer_draw_text(char_x, y, text, font, fg, bg, buffer_height);
+}
+
+static void draw_calibration_done_screen(void)
+{
+    fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
+    fill_round_rect(18, 52, 284, 66, 4, COLOR_PANEL);
+    draw_panel_outline(16, 50, 288, 70, COLOR_GREEN);
+    draw_plain_text_on_bg(33, 72, "CALIBRATE DONE", &instrument_30,
+                          COLOR_GREEN, COLOR_PANEL, 18, 302, 52, 118);
 }
 
 static void draw_setting_screen(const app_state_t *s, bool draw_frame)
 {
     char value[8];
 
+    if (s->control.calibration_done) {
+        draw_calibration_done_screen();
+        return;
+    }
+    if (s->control.calibration_running) {
+        draw_calibration_progress_screen(s, draw_frame);
+        return;
+    }
+    if (s->control.calibration_confirm) {
+        draw_calibration_confirm_screen(s, draw_frame);
+        return;
+    }
+
     if (draw_frame) {
         fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
-        fill_rect(8, 29, TFT_WIDTH - 16, 28, COLOR_PANEL);
-        draw_panel_outline(6, 27, TFT_WIDTH - 12, 32, COLOR_CYAN);
-        fill_rect(8, 65, TFT_WIDTH - 16, 28, COLOR_PANEL);
-        draw_panel_outline(6, 63, TFT_WIDTH - 12, 32, COLOR_PURPLE);
-        fill_rect(8, 101, TFT_WIDTH - 16, 28, COLOR_PANEL);
-        draw_panel_outline(6, 99, TFT_WIDTH - 12, 32, COLOR_CYAN);
-        fill_rect(8, 137, TFT_WIDTH - 16, 30, COLOR_PANEL);
-        draw_panel_outline(6, 135, TFT_WIDTH - 12, 34, COLOR_PURPLE);
+        fill_rect(8, 29, 146, 28, COLOR_PANEL);
+        draw_panel_outline(6, 27, 150, 32, COLOR_CYAN);
+        fill_rect(166, 29, 146, 28, COLOR_PANEL);
+        draw_panel_outline(164, 27, 150, 32, COLOR_PURPLE);
+        fill_rect(8, 65, 146, 28, COLOR_PANEL);
+        draw_panel_outline(6, 63, 150, 32, COLOR_PURPLE);
+        fill_rect(166, 65, 146, 28, COLOR_PANEL);
+        draw_panel_outline(164, 63, 150, 32, COLOR_CYAN);
+        fill_rect(8, 101, 146, 28, COLOR_PANEL);
+        draw_panel_outline(6, 99, 150, 32, COLOR_CYAN);
     }
-    draw_text(8, 4, "SETTING", &instrument_18, COLOR_CYAN);
+    if (draw_frame) {
+        draw_text(8, 4, "SETTING", &instrument_18, COLOR_CYAN);
+    }
 
-    draw_setting_line(31,
+    draw_setting_line(12, 31, 8, 154,
                       "Overcurrent",
-                      s->control.overcurrent_cc ? "CC" : "OFF",
+                      s->control.overcurrent_cc ? "CC" : "TRG",
+                      NULL,
+                      COLOR_LABEL,
                       CONTROL_SELECT_OVERCURRENT,
                       s, 29, 57);
     snprintf(value, sizeof(value), "%02u", (unsigned)s->control.overheat_c);
-    draw_setting_line(67, "Overheat", value, CONTROL_SELECT_OVERHEAT, s, 65, 93);
-    snprintf(value, sizeof(value), "%03u", (unsigned)s->control.overpower_w);
-    draw_setting_line(103, "Overpower", value, CONTROL_SELECT_OVERPOWER, s, 101, 129);
-    snprintf(value, sizeof(value), "%03u", (unsigned)s->control.volume_percent);
-    draw_setting_line(139, "Volume", value, CONTROL_SELECT_VOLUME, s, 137, 167);
+    draw_setting_line(170, 31, 166, 312, "Overheat", value, NULL, COLOR_LABEL,
+                      CONTROL_SELECT_OVERHEAT, s, 29, 57);
+    if (s->control.overpower_w == 0U) snprintf(value, sizeof(value), "--");
+    else snprintf(value, sizeof(value), "%u", (unsigned)s->control.overpower_w);
+    draw_setting_line(12, 67, 8, 154, "Overpower", value, "W", COLOR_LABEL,
+                      CONTROL_SELECT_OVERPOWER, s, 65, 93);
+    snprintf(value, sizeof(value), "%u", (unsigned)s->control.volume_percent);
+    draw_setting_line(170, 67, 166, 312, "Volume", value, NULL, COLOR_LABEL,
+                      CONTROL_SELECT_VOLUME, s, 65, 93);
+    draw_setting_line(12, 103, 8, 154,
+                      "Calib",
+                      s->control.calibration_on || s->control.calibration_running ? "ON" : "OFF",
+                      NULL,
+                      COLOR_LABEL,
+                      CONTROL_SELECT_CALIBRATION,
+                      s, 101, 129);
 }
 
-static void draw_1wire_screen(const app_state_t *s, bool draw_frame)
+static const char *current_graph_channel_text(uint8_t channels)
 {
-    uint16_t fg[16];
-    uint16_t bg[16];
-    if (draw_frame) draw_interface_frame(false, "DQ", "");
+    if (channels == CURRENT_GRAPH_CHANNEL_A) return "A";
+    if (channels == CURRENT_GRAPH_CHANNEL_B) return "B";
+    return "AB";
+}
 
-    fill_text_colors(fg, bg, 16U);
-    for (size_t i = 0U; i < strlen("1WIRE"); ++i) fg[i] = COLOR_CYAN;
-    draw_rich_text_on_panel_clipped(10, 4, "1WIRE", &instrument_18, fg, bg,
+static void draw_graph_pixel(int x, int y, uint16_t color)
+{
+    if (x < CURRENT_GRAPH_X || x >= CURRENT_GRAPH_X + CURRENT_GRAPH_W ||
+        y < s_graph_slice_y || y >= s_graph_slice_y + s_graph_slice_h) {
+        return;
+    }
+    s_text_buffer[(y - s_graph_slice_y) * TFT_WIDTH + x] = display_pixel(color);
+}
+
+static void draw_graph_line(int x0, int y0, int x1, int y1, uint16_t color)
+{
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = y1 > y0 ? y0 - y1 : y1 - y0;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+
+    while (true) {
+        draw_graph_pixel(x0, y0, color);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+static uint16_t current_graph_next_auto_scale(uint16_t scale_ma)
+{
+    switch (scale_ma) {
+        case 10U: return 100U;
+        case 100U: return 1000U;
+        case 1000U: return 5000U;
+        default: return 5000U;
+    }
+}
+
+static uint16_t current_graph_previous_auto_scale(uint16_t scale_ma)
+{
+    switch (scale_ma) {
+        case 5000U: return 1000U;
+        case 1000U: return 100U;
+        case 100U: return 10U;
+        default: return 10U;
+    }
+}
+
+static int32_t graph_abs_ma(int32_t value)
+{
+    return value < 0 ? -value : value;
+}
+
+static uint16_t current_graph_auto_scale(const current_graph_snapshot_t *graph,
+                                         uint8_t channels)
+{
+    static uint16_t auto_scale_ma = 1000U;
+    static uint8_t low_count;
+    int32_t max_ma = 0;
+
+    for (size_t i = 0U; i < graph->count; ++i) {
+        if ((channels & CURRENT_GRAPH_CHANNEL_A) != 0U && graph->a_valid[i]) {
+            int32_t value = graph_abs_ma(graph->a_ma[i]);
+            if (value > max_ma) max_ma = value;
+        }
+        if ((channels & CURRENT_GRAPH_CHANNEL_B) != 0U && graph->b_valid[i]) {
+            int32_t value = graph_abs_ma(graph->b_ma[i]);
+            if (value > max_ma) max_ma = value;
+        }
+    }
+
+    uint32_t full_scale_ma = auto_scale_ma;
+    if (max_ma > (int32_t)(full_scale_ma * 9U / 10U)) {
+        auto_scale_ma = current_graph_next_auto_scale(auto_scale_ma);
+        low_count = 0U;
+    } else if (max_ma < (int32_t)(full_scale_ma / 4U)) {
+        if (low_count < 30U) ++low_count;
+        if (low_count >= 30U) {
+            auto_scale_ma = current_graph_previous_auto_scale(auto_scale_ma);
+            low_count = 0U;
+        }
+    } else {
+        low_count = 0U;
+    }
+
+    return auto_scale_ma;
+}
+
+static int graph_y_from_current(int32_t current_ma, uint16_t scale_ma)
+{
+    int usable = CURRENT_GRAPH_H - 4;
+    uint32_t full_scale_ma;
+    if (scale_ma == 0U) scale_ma = 1000U;
+    full_scale_ma = scale_ma;
+    if (current_ma < 0) current_ma = 0;
+    if (current_ma > (int32_t)full_scale_ma) current_ma = (int32_t)full_scale_ma;
+    int y = CURRENT_GRAPH_Y + CURRENT_GRAPH_H - 2 -
+            (int)(((int64_t)current_ma * usable) / full_scale_ma);
+    if (y < CURRENT_GRAPH_Y + 1) y = CURRENT_GRAPH_Y + 1;
+    if (y > CURRENT_GRAPH_Y + CURRENT_GRAPH_H - 2) y = CURRENT_GRAPH_Y + CURRENT_GRAPH_H - 2;
+    return y;
+}
+
+static void draw_current_graph_channel(const current_graph_snapshot_t *graph,
+                                       bool channel_a,
+                                       uint16_t color,
+                                       uint16_t scale_ma)
+{
+    bool have_previous = false;
+    int previous_x = 0;
+    int previous_y = 0;
+    size_t count = graph->count > CURRENT_GRAPH_W ? CURRENT_GRAPH_W : graph->count;
+    size_t start = graph->count - count;
+
+    for (size_t i = 0U; i < count; ++i) {
+        size_t src = start + i;
+        bool valid = channel_a ? graph->a_valid[src] : graph->b_valid[src];
+        if (!valid) {
+            have_previous = false;
+            continue;
+        }
+        int32_t current_ma = channel_a ? graph->a_ma[src] : graph->b_ma[src];
+        int x = CURRENT_GRAPH_X + CURRENT_GRAPH_W - (int)count + (int)i;
+        int y = graph_y_from_current(current_ma, scale_ma);
+        if (have_previous) draw_graph_line(previous_x, previous_y, x, y, color);
+        else draw_graph_pixel(x, y, color);
+        previous_x = x;
+        previous_y = y;
+        have_previous = true;
+    }
+}
+
+static void format_current_div(uint16_t full_scale_ma,
+                               char *value,
+                               size_t value_size,
+                               const char **unit)
+{
+    uint16_t ma_per_div = (uint16_t)(full_scale_ma / CURRENT_GRAPH_CELLS_Y);
+    if (ma_per_div >= 1000U && (ma_per_div % 1000U) == 0U) {
+        snprintf(value, value_size, "%u", (unsigned)(ma_per_div / 1000U));
+        *unit = "A/div";
+    } else {
+        snprintf(value, value_size, "%u", (unsigned)ma_per_div);
+        *unit = "mA/div";
+    }
+}
+
+static void format_time_div(uint8_t decimation,
+                            char *value,
+                            size_t value_size,
+                            const char **unit)
+{
+    uint32_t ms = (uint32_t)decimation * CURRENT_GRAPH_BASE_SAMPLE_MS *
+                  CURRENT_GRAPH_SAMPLES_PER_DIV;
+    if (ms < 1000U) {
+        snprintf(value, value_size, "%lu", (unsigned long)ms);
+        *unit = "ms/div";
+    } else if ((ms % 1000U) == 0U) {
+        snprintf(value, value_size, "%lu", (unsigned long)(ms / 1000U));
+        *unit = "s/div";
+    } else {
+        snprintf(value, value_size, "%lu.%lu",
+                 (unsigned long)(ms / 1000U),
+                 (unsigned long)((ms % 1000U) / 100U));
+        *unit = "s/div";
+    }
+}
+
+static void draw_current_graph_header(const app_state_t *s, uint16_t scale_ma)
+{
+    char line[96] = "";
+    char time_value[16];
+    char current_value[16];
+    const char *time_unit = "s/div";
+    const char *current_unit = "mA/div";
+    uint16_t fg[96];
+    uint16_t bg[96];
+    size_t pos = 0U;
+    size_t rate_start;
+    size_t rate_len;
+    size_t scale_start;
+    size_t scale_len;
+    size_t ch_start;
+    size_t ch_len;
+
+    format_time_div(s->control.current_graph_decimation,
+                    time_value,
+                    sizeof(time_value),
+                    &time_unit);
+    format_current_div(scale_ma, current_value, sizeof(current_value), &current_unit);
+
+    fill_text_colors(fg, bg, 96U);
+    append_colored(line, fg, bg, &pos, "T", COLOR_RED);
+    rate_start = pos;
+    append_colored(line, fg, bg, &pos, time_value, COLOR_WHITE);
+    append_colored(line, fg, bg, &pos, time_unit, COLOR_BLUE);
+    rate_len = strlen(time_value) + strlen(time_unit);
+    append_colored(line, fg, bg, &pos, "  I", COLOR_RED);
+    scale_start = pos;
+    if (s->control.current_graph_scale_ma == 0U) {
+        append_colored(line, fg, bg, &pos, "auto ", COLOR_BLUE);
+    }
+    append_colored(line, fg, bg, &pos, current_value, COLOR_WHITE);
+    append_colored(line, fg, bg, &pos, current_unit, COLOR_BLUE);
+    scale_len = pos - scale_start;
+    append_colored(line, fg, bg, &pos, "  CH", COLOR_RED);
+    ch_start = pos;
+    append_colored(line, fg, bg, &pos,
+                   current_graph_channel_text(s->control.current_graph_channels),
+                   COLOR_WHITE);
+    ch_len = strlen(current_graph_channel_text(s->control.current_graph_channels));
+
+    bool show_edit = s->control.selected_digit == CONTROL_DIGIT_WHOLE ||
+                     ((esp_timer_get_time() / 500000LL) & 1LL) == 0LL;
+    if (s->control.selected_value == CONTROL_SELECT_CURRENT_RATE && show_edit) {
+        mark_range(fg, bg, rate_start, rate_len, COLOR_BLACK, COLOR_YELLOW);
+    } else if (s->control.selected_value == CONTROL_SELECT_CURRENT_SCALE && show_edit) {
+        mark_range(fg, bg, scale_start, scale_len, COLOR_BLACK, COLOR_YELLOW);
+    } else if (s->control.selected_value == CONTROL_SELECT_CURRENT_CHANNEL && show_edit) {
+        mark_range(fg, bg, ch_start, ch_len, COLOR_BLACK, COLOR_YELLOW);
+    }
+
+    draw_rich_text_on_panel_clipped(10, 4, line, &instrument_18, fg, bg,
                                     COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
                                     3, 24);
+}
 
-    fill_text_colors(fg, bg, 16U);
-    for (size_t i = 0U; i < strlen("RESERVED"); ++i) fg[i] = COLOR_GRAY;
-    draw_rich_text_on_panel_clipped(10, 58, "RESERVED", &instrument_30, fg, bg,
-                                    COLOR_PANEL, 8, INTERFACE_MAIN_INNER_RIGHT,
-                                    28, 121);
+static void draw_current_graph_screen(const app_state_t *s, bool draw_frame)
+{
+    current_graph_snapshot_t graph;
+    uint16_t scale_ma;
+    if (draw_frame) draw_interface_frame(false, "", "");
+
+    current_graph_snapshot(&graph);
+    scale_ma = s->control.current_graph_scale_ma != 0U ?
+               s->control.current_graph_scale_ma :
+               current_graph_auto_scale(&graph, s->control.current_graph_channels);
+    draw_current_graph_header(s, scale_ma);
+
+    for (int slice_y = CURRENT_GRAPH_Y;
+         slice_y < CURRENT_GRAPH_Y + CURRENT_GRAPH_H;
+         slice_y += (int)DISPLAY_BUFFER_ROWS) {
+        int slice_h = CURRENT_GRAPH_Y + CURRENT_GRAPH_H - slice_y;
+        if (slice_h > (int)DISPLAY_BUFFER_ROWS) slice_h = (int)DISPLAY_BUFFER_ROWS;
+        s_graph_slice_y = slice_y;
+        s_graph_slice_h = slice_h;
+
+        buffer_fill_rect(CURRENT_GRAPH_X, 0, CURRENT_GRAPH_W, slice_h,
+                         slice_h, COLOR_PANEL);
+        for (int x = CURRENT_GRAPH_X;
+             x < CURRENT_GRAPH_X + CURRENT_GRAPH_W;
+             x += CURRENT_GRAPH_SAMPLES_PER_DIV) {
+            for (int y = CURRENT_GRAPH_Y; y < CURRENT_GRAPH_Y + CURRENT_GRAPH_H; y += 4) {
+                draw_graph_pixel(x, y, RGB565(125, 145, 180));
+            }
+        }
+        for (int cell = 0; cell <= CURRENT_GRAPH_CELLS_Y; ++cell) {
+            int y = CURRENT_GRAPH_Y +
+                    (cell * (CURRENT_GRAPH_H - 1)) / CURRENT_GRAPH_CELLS_Y;
+            for (int x = CURRENT_GRAPH_X; x < CURRENT_GRAPH_X + CURRENT_GRAPH_W; x += 4) {
+                draw_graph_pixel(x, y, RGB565(125, 145, 180));
+            }
+        }
+        for (int x = CURRENT_GRAPH_X; x < CURRENT_GRAPH_X + CURRENT_GRAPH_W; x += 2) {
+            draw_graph_pixel(x, CURRENT_GRAPH_Y + CURRENT_GRAPH_H - 2, RGB565(155, 170, 195));
+        }
+        if ((s->control.current_graph_channels & CURRENT_GRAPH_CHANNEL_A) != 0U) {
+            draw_current_graph_channel(&graph, true, COLOR_CYAN, scale_ma);
+        }
+        if ((s->control.current_graph_channels & CURRENT_GRAPH_CHANNEL_B) != 0U) {
+            draw_current_graph_channel(&graph, false, COLOR_PURPLE, scale_ma);
+        }
+        send_text_buffer_region(CURRENT_GRAPH_X, slice_y, CURRENT_GRAPH_W, slice_h);
+    }
     draw_bottom_actuals_to(s, INTERFACE_MAIN_INNER_RIGHT);
 }
 
 static const char *mode_menu_name(app_mode_t mode)
 {
     switch (mode) {
-        case APP_MODE_POWER_SUPPLY: return "POWER SOURCE";
+        case APP_MODE_POWER_SUPPLY: return "POWER source";
+        case APP_MODE_1WIRE:        return "CURRENT graph";
         case APP_MODE_GENERATOR:    return "GENERATOR";
-        case APP_MODE_UART:         return "UART";
-        case APP_MODE_LIN:          return "LIN";
-        case APP_MODE_1WIRE:        return "1WIRE";
-        case APP_MODE_RS485:        return "RS485";
-        case APP_MODE_CAN:          return "CAN";
-        case APP_MODE_I2C:          return "I2C SNIFFER";
-        case APP_MODE_I2C_MASTER:   return "I2C MASTER";
+        case APP_MODE_UART:         return "UART term";
+        case APP_MODE_LIN:          return "LIN sniffer";
+        case APP_MODE_CAN:          return "CAN term";
+        case APP_MODE_RS485:        return "RS485 term";
+        case APP_MODE_I2C:          return "I2C sniffer";
+        case APP_MODE_I2C_MASTER:   return "I2C master";
         case APP_MODE_SETTING:      return "SETTING";
         default:                    return "?";
     }
@@ -1806,6 +2443,42 @@ static void draw_power_probe_badge(uint32_t voltage_mv,
                                     31, 31 + badge_size);
 }
 
+static void format_probe_resistance(char *out, size_t size, uint32_t span_mv)
+{
+    const uint32_t source_ohm = PROBE_SYNC_SOURCE_OHM;
+    const uint32_t open_span_mv = PROBE_SYNC_OPEN_SPAN_MV;
+    const uint32_t source_mv = 3300U;
+
+    if (span_mv == 0U || open_span_mv == 0U ||
+        open_span_mv >= source_mv || span_mv >= open_span_mv) {
+        snprintf(out, size, "--");
+        return;
+    }
+
+    uint64_t base_ohm = ((uint64_t)source_ohm * open_span_mv +
+                         (source_mv - open_span_mv) / 2U) /
+                        (source_mv - open_span_mv);
+    uint64_t equivalent_ohm = ((uint64_t)source_ohm * span_mv +
+                               (source_mv - span_mv) / 2U) /
+                              (source_mv - span_mv);
+
+    if (base_ohm == 0U || equivalent_ohm >= base_ohm) {
+        snprintf(out, size, "--");
+        return;
+    }
+
+    uint64_t external_ohm = (equivalent_ohm * base_ohm +
+                             (base_ohm - equivalent_ohm) / 2U) /
+                            (base_ohm - equivalent_ohm);
+    if (external_ohm > 50000U) {
+        snprintf(out, size, "--");
+    } else if (external_ohm < 1000U) {
+        snprintf(out, size, "0k");
+    } else {
+        snprintf(out, size, "%luk", (unsigned long)((external_ohm + 500U) / 1000U));
+    }
+}
+
 static void draw_power_probe_span(uint32_t span_mv)
 {
     char value[12];
@@ -1813,8 +2486,7 @@ static void draw_power_probe_span(uint32_t span_mv)
     uint16_t bg[12];
     int inner_x = POWER_SIDE_FRAME_X + 2;
     int inner_width = POWER_SIDE_FRAME_WIDTH - 4;
-    if (span_mv > 9999U) span_mv = 9999U;
-    snprintf(value, sizeof(value), "%lumV", (unsigned long)span_mv);
+    format_probe_resistance(value, sizeof(value), span_mv);
     fill_text_colors(fg, bg, 8U);
     mark_range(fg, bg, 0U, strlen(value), COLOR_WHITE, COLOR_PANEL);
     int value_x = inner_x + (inner_width - text_width(value, &instrument_18)) / 2;
@@ -2010,13 +2682,16 @@ void display_render(const app_state_t *s)
     static bool generator_screen_initialized;
     static bool serial_screen_initialized;
     static bool setting_screen_initialized;
+    static uint8_t previous_setting_view = 0xFFU;
     static uint16_t previous_probe_color = 0xFFFFU;
     static uint32_t previous_probe_tenths = UINT32_MAX;
     static uint32_t previous_probe_span_mv = UINT32_MAX;
     static uint32_t displayed_probe_tenths = UINT32_MAX;
+    static char mode_line[768];
     char line[64];
-    char mode_line[768];
     uint8_t edit_blink_phase = (uint8_t)((esp_timer_get_time() / 500000LL) & 1LL);
+    uint8_t active_blink_phase =
+        s->control.selected_digit != CONTROL_DIGIT_WHOLE ? edit_blink_phase : 2U;
 
     if (previous_menu_open != s->control.menu_open) {
         fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, COLOR_BLACK);
@@ -2028,6 +2703,7 @@ void display_render(const app_state_t *s)
         generator_screen_initialized = false;
         serial_screen_initialized = false;
         setting_screen_initialized = false;
+        previous_setting_view = 0xFFU;
         previous_probe_color = 0xFFFFU;
         previous_probe_tenths = UINT32_MAX;
         previous_probe_span_mv = UINT32_MAX;
@@ -2058,6 +2734,7 @@ void display_render(const app_state_t *s)
         generator_screen_initialized = false;
         serial_screen_initialized = false;
         setting_screen_initialized = false;
+        previous_setting_view = 0xFFU;
         previous_mode = s->control.mode;
     }
 
@@ -2073,10 +2750,27 @@ void display_render(const app_state_t *s)
             return;
         }
 
-        snprintf(mode_line, sizeof(mode_line), "M%u S%u D%u F%lu P%u O%u U%lu L%lu R%lu C%lu LM%s CM%s IM%s OC%u OH%u OP%u V%u T%s|%s|%s UE%lu I%s|%s|%s|%s IP%lu IE%lu A%u%lu%ld B%u%lu%ld",
+        uint8_t setting_view = 0U;
+        if (s->control.mode == APP_MODE_SETTING) {
+            if (s->control.calibration_confirm) setting_view = 1U;
+            else if (s->control.calibration_running) setting_view = 2U;
+            else if (s->control.calibration_done) setting_view = 3U;
+            if (setting_view != previous_setting_view) {
+                setting_screen_initialized = false;
+                previous_mode_screen[0] = '\0';
+                previous_setting_view = setting_view;
+            }
+        } else {
+            previous_setting_view = 0xFFU;
+        }
+
+        uint8_t mode_blink_phase = s->control.selected_digit != CONTROL_DIGIT_WHOLE ?
+                                   active_blink_phase : 2U;
+        snprintf(mode_line, sizeof(mode_line), "M%u S%u D%u B%u F%lu P%u O%u U%lu L%lu R%lu C%lu GR%u GS%u GC%u GQ%lu LM%s CM%s IM%s OC%u OH%u OP%u V%u CF%u CO%u CR%u CD%u CK%u CT%u CMV%lu CI%lld CS%lu T%s|%s|%s UE%lu I%s|%s|%s|%s IP%lu IE%lu A%u%lu%ld B%u%lu%ld",
                      (unsigned)s->control.mode,
                      (unsigned)s->control.selected_value,
                      (unsigned)s->control.selected_digit,
+                     (unsigned)mode_blink_phase,
                      (unsigned long)s->control.generator_freq_hz,
                      (unsigned)s->control.generator_duty_percent,
                      s->control.generator_on ? 1U : 0U,
@@ -2084,6 +2778,10 @@ void display_render(const app_state_t *s)
                      (unsigned long)s->control.lin_baud,
                      (unsigned long)s->control.rs485_baud,
                      (unsigned long)s->control.can_bitrate,
+                     (unsigned)s->control.current_graph_decimation,
+                     (unsigned)s->control.current_graph_scale_ma,
+                     (unsigned)s->control.current_graph_channels,
+                     (unsigned long)(s->control.mode == APP_MODE_1WIRE ? current_graph_sequence() : 0U),
                      s->control.lin_mask,
                      s->control.can_mask,
                      s->control.i2c_mask,
@@ -2091,6 +2789,15 @@ void display_render(const app_state_t *s)
                      (unsigned)s->control.overheat_c,
                      (unsigned)s->control.overpower_w,
                      (unsigned)s->control.volume_percent,
+                     s->control.calibration_confirm ? 1U : 0U,
+                     s->control.calibration_confirm_ok ? 1U : 0U,
+                     s->control.calibration_running ? 1U : 0U,
+                     s->control.calibration_done ? 1U : 0U,
+                     (unsigned)(uint8_t)s->control.calibration_channel,
+                     (unsigned)s->control.calibration_target_mv,
+                     (unsigned long)s->control.calibration_measured_mv,
+                     (long long)s->control.calibration_measured_current_ua,
+                     (unsigned long)s->control.calibration_sample_count,
                      (s->control.mode == APP_MODE_UART || s->control.mode == APP_MODE_LIN ||
                       s->control.mode == APP_MODE_RS485) ? s->uart.lines[0] : "",
                      (s->control.mode == APP_MODE_UART || s->control.mode == APP_MODE_LIN ||
@@ -2132,7 +2839,7 @@ void display_render(const app_state_t *s)
                     serial_screen_initialized = true;
                     break;
                 case APP_MODE_1WIRE:
-                    draw_1wire_screen(s, !serial_screen_initialized);
+                    draw_current_graph_screen(s, !serial_screen_initialized);
                     serial_screen_initialized = true;
                     break;
                 case APP_MODE_RS485:
@@ -2233,8 +2940,9 @@ void display_render(const app_state_t *s)
                  (unsigned)s->control.selected_value,
                  (unsigned)s->control.selected_digit,
                  s->tps55289.current_limit_active ? 1U : 0U,
-                 (s->control.selected_value == CONTROL_SELECT_I2 &&
-                  s->control.selected_digit != CONTROL_DIGIT_WHOLE) ? edit_blink_phase : 2U);
+                 (s->control.selected_digit != CONTROL_DIGIT_WHOLE &&
+                  (s->control.selected_value == CONTROL_SELECT_U2 ||
+                   s->control.selected_value == CONTROL_SELECT_I2)) ? edit_blink_phase : 2U);
     } else {
         snprintf(line, sizeof(line), "A--%u%u%u%u%u%u%u",
                  (unsigned)s->control.u2_mv,
@@ -2243,8 +2951,9 @@ void display_render(const app_state_t *s)
                  (unsigned)s->control.selected_value,
                  (unsigned)s->control.selected_digit,
                  s->tps55289.current_limit_active ? 1U : 0U,
-                 (s->control.selected_value == CONTROL_SELECT_I2 &&
-                  s->control.selected_digit != CONTROL_DIGIT_WHOLE) ? edit_blink_phase : 2U);
+                 (s->control.selected_digit != CONTROL_DIGIT_WHOLE &&
+                  (s->control.selected_value == CONTROL_SELECT_U2 ||
+                   s->control.selected_value == CONTROL_SELECT_I2)) ? edit_blink_phase : 2U);
     }
     if (strcmp(previous_ch_a, line) != 0) {
         draw_channel_actual_line(6, 'A', ina,
@@ -2254,7 +2963,8 @@ void display_render(const app_state_t *s)
                               2U, 3U,
                               s->control.selected_value,
                               s->control.selected_digit,
-                              edit_blink_phase == 0U);
+                              edit_blink_phase == 0U,
+                              s->tps55289.current_limit_active);
         snprintf(previous_ch_a, sizeof(previous_ch_a), "%s", line);
     }
 
@@ -2270,8 +2980,9 @@ void display_render(const app_state_t *s)
                  (unsigned)s->control.selected_value,
                  (unsigned)s->control.selected_digit,
                  s->lm51772.current_limit_active ? 1U : 0U,
-                 (s->control.selected_value == CONTROL_SELECT_I1 &&
-                  s->control.selected_digit != CONTROL_DIGIT_WHOLE) ? edit_blink_phase : 2U);
+                 (s->control.selected_digit != CONTROL_DIGIT_WHOLE &&
+                  (s->control.selected_value == CONTROL_SELECT_U1 ||
+                   s->control.selected_value == CONTROL_SELECT_I1)) ? edit_blink_phase : 2U);
     } else {
         snprintf(line, sizeof(line), "B--%u%u%u%u%u%u%u",
                  (unsigned)s->control.u1_mv,
@@ -2280,8 +2991,9 @@ void display_render(const app_state_t *s)
                  (unsigned)s->control.selected_value,
                  (unsigned)s->control.selected_digit,
                  s->lm51772.current_limit_active ? 1U : 0U,
-                 (s->control.selected_value == CONTROL_SELECT_I1 &&
-                  s->control.selected_digit != CONTROL_DIGIT_WHOLE) ? edit_blink_phase : 2U);
+                 (s->control.selected_digit != CONTROL_DIGIT_WHOLE &&
+                  (s->control.selected_value == CONTROL_SELECT_U1 ||
+                   s->control.selected_value == CONTROL_SELECT_I1)) ? edit_blink_phase : 2U);
     }
     if (strcmp(previous_ch_b, line) != 0) {
         draw_channel_actual_line(74, 'B', ina,
@@ -2291,7 +3003,8 @@ void display_render(const app_state_t *s)
                               0U, 1U,
                               s->control.selected_value,
                               s->control.selected_digit,
-                              edit_blink_phase == 0U);
+                              edit_blink_phase == 0U,
+                              s->lm51772.current_limit_active);
         snprintf(previous_ch_b, sizeof(previous_ch_b), "%s", line);
     }
 

@@ -14,7 +14,6 @@
 
 #define CAN_COMMAND_CHARS 64U
 #define CAN_COMMAND_IDLE_US 200000LL
-#define CAN_AUTO_TX_PERIOD_US 1000000LL
 #define CAN_RECOVERY_RETRY_US 1000000LL
 
 #define CAN_TX_RESULT_NONE 0U
@@ -43,9 +42,7 @@ static uint8_t s_mask_care;
 static char s_command[CAN_COMMAND_CHARS];
 static size_t s_command_used;
 static int64_t s_command_last_us;
-static int64_t s_last_auto_tx_us;
 static int64_t s_recovery_started_us;
-static uint8_t s_auto_tx_counter;
 static esp_err_t s_last_config_error;
 static uint32_t s_last_config_error_bitrate;
 
@@ -260,7 +257,6 @@ static esp_err_t start_driver(uint32_t bitrate)
     s_bus_off = false;
     s_recovering = false;
     s_recovery_started_us = 0LL;
-    s_last_auto_tx_us = esp_timer_get_time();
     s_last_config_error = ESP_OK;
     s_last_config_error_bitrate = 0U;
     twai_status_info_t status;
@@ -295,22 +291,14 @@ static bool parse_can_command(const char *command, uint32_t *identifier, uint8_t
         if (nibble < 0 || count >= sizeof(nibbles)) return false;
         nibbles[count++] = (uint8_t)nibble;
     }
-    if (count < 3U) return false;
+    if (count < 4U) return false;
 
     uint32_t id = 0U;
-    uint8_t data_start = 3U;
-    if ((count & 1U) == 0U) {
-        id = ((uint32_t)nibbles[0] << 12U) |
-             ((uint32_t)nibbles[1] << 8U) |
-             ((uint32_t)nibbles[2] << 4U) |
-             (uint32_t)nibbles[3];
-        data_start = 4U;
-    } else {
-        id = ((uint32_t)nibbles[0] << 8U) |
-             ((uint32_t)nibbles[1] << 4U) |
-             (uint32_t)nibbles[2];
-        data_start = 3U;
-    }
+    uint8_t data_start = 4U;
+    id = ((uint32_t)nibbles[0] << 12U) |
+         ((uint32_t)nibbles[1] << 8U) |
+         ((uint32_t)nibbles[2] << 4U) |
+         (uint32_t)nibbles[3];
     if (id > 0x7FFU || ((count - data_start) & 1U) != 0U) return false;
 
     uint8_t dlc = (uint8_t)((count - data_start) / 2U);
@@ -390,7 +378,6 @@ static void poll_alerts(void)
         s_recovery_started_us = 0LL;
         if (twai_start() == ESP_OK) {
             s_running = true;
-            s_last_auto_tx_us = esp_timer_get_time();
             store_status("RUN");
         }
     }
@@ -423,7 +410,6 @@ static void sync_driver_status(void)
         s_recovery_started_us = 0LL;
         if (twai_start() == ESP_OK) {
             s_running = true;
-            s_last_auto_tx_us = esp_timer_get_time();
             store_status("RUN");
         }
     } else if (status.state == TWAI_STATE_RUNNING) {
@@ -458,26 +444,11 @@ static void recovery_timer_update(int64_t now_us)
         s_bus_off = false;
         if (twai_start() == ESP_OK) {
             s_running = true;
-            s_last_auto_tx_us = now_us;
             store_status("RUN");
         }
     } else if (status.state == TWAI_STATE_RECOVERING) {
         s_recovery_started_us = now_us;
     }
-}
-
-static void auto_tx_update(int64_t now_us)
-{
-    uint16_t board_number = bluetooth_spp_board_number();
-    uint8_t data[8];
-    uint8_t board_byte = (uint8_t)(board_number & 0xFFU);
-    if (!s_running || s_bus_off || s_recovering) return;
-    if (now_us - s_last_auto_tx_us < CAN_AUTO_TX_PERIOD_US) return;
-    s_last_auto_tx_us = now_us;
-    memset(data, board_byte, sizeof(data));
-    data[0] = s_auto_tx_counter++;
-    uint32_t identifier = 0x400U + (uint32_t)(board_number & 0x3FFU);
-    (void)transmit_frame(identifier, data, sizeof(data));
 }
 
 esp_err_t can_probe_init(void)
@@ -555,8 +526,6 @@ void can_probe_update(app_state_t *state, int64_t now_us)
             publish_frame(&message);
         }
     }
-    auto_tx_update(now_us);
-
     if (state == NULL) return;
     portENTER_CRITICAL(&s_text_lock);
     memcpy(state->can.text, s_text, sizeof(state->can.text));

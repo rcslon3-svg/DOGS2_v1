@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "calibration.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "i2c_bus.h"
@@ -55,8 +56,10 @@
 #define LM51772_VOUT_HIGH_STEP_MV       20U
 #define LM51772_CUR_LIMIT_STEP_UV       500U
 #define LM51772_CUR_LIMIT_MAX_CODE      0xFFU
-#define LM51772_FIXED_DIV20             true
 #define LM51772_FIXED_DIV20_BIT         LM51772_D8_SEL_FB_DIV20
+#define CHANNEL_B_TRIM_ARM_ERROR_MV     300
+#define CHANNEL_B_TRIM_ARM_SAMPLES      3U
+#define CHANNEL_B_I2C_TIMEOUT_MS        8
 
 static i2c_master_dev_handle_t s_lm51772;
 static const char *TAG = "channelB";
@@ -66,6 +69,10 @@ static bool s_last_output_enabled;
 static uint16_t s_last_target_mv;
 static uint16_t s_last_target_ma;
 static uint16_t s_last_command_mv;
+static bool s_last_div20;
+static int64_t s_trim_hold_until_us;
+static uint8_t s_trim_arm_count;
+static bool s_trim_armed;
 
 /* write_u8
  * Inputs: register address and byte value.
@@ -80,7 +87,10 @@ static esp_err_t write_u8(uint8_t reg, uint8_t value)
         ++debug_log_count;
         ESP_LOGI(TAG, "I2C_TX LM W %02X %02X %02X", CHANNEL_B_LM51772_ADDRESS, reg, value);
     }
-    esp_err_t err = i2c_master_transmit(s_lm51772, bytes, sizeof(bytes), 100);
+    esp_err_t err = i2c_master_transmit(s_lm51772,
+                                        bytes,
+                                        sizeof(bytes),
+                                        CHANNEL_B_I2C_TIMEOUT_MS);
     if (err != ESP_OK) ESP_LOGW(TAG, "write %02X=%02X: %s", reg, value, esp_err_to_name(err));
     return err;
 }
@@ -98,7 +108,12 @@ static esp_err_t read_u8(uint8_t reg, uint8_t *value)
         ++debug_log_count;
         ESP_LOGI(TAG, "I2C_TX LM R %02X %02X", CHANNEL_B_LM51772_ADDRESS, reg);
     }
-    esp_err_t err = i2c_master_transmit_receive(s_lm51772, &reg, 1, value, 1, 100);
+    esp_err_t err = i2c_master_transmit_receive(s_lm51772,
+                                                &reg,
+                                                1,
+                                                value,
+                                                1,
+                                                CHANNEL_B_I2C_TIMEOUT_MS);
     if (err != ESP_OK) ESP_LOGW(TAG, "read %02X: %s", reg, esp_err_to_name(err));
     return err;
 }
@@ -149,6 +164,11 @@ static uint16_t code_to_voltage_mv(uint16_t code, bool div20)
     return (uint16_t)((uint32_t)code * step_mv);
 }
 
+static bool select_div20(uint16_t command_mv)
+{
+    return command_mv > LM51772_VOUT_LOW_MAX_MV;
+}
+
 /* current_to_code
  * Inputs: current limit in milliamps.
  * Returns: LM51772 current-limit DAC code.
@@ -185,8 +205,11 @@ static int32_t clamp_s32(int32_t value, int32_t min_value, int32_t max_value)
 static int32_t measured_current_ma(const app_ina238_channel_t *measurement)
 {
     if (!measurement->valid || measurement->shunt_uohm == 0U) return 0;
-    return (int32_t)(((int64_t)measurement->shunt_uv * 1000LL) /
-                     (int64_t)measurement->shunt_uohm);
+    int64_t current_ua = calibration_correct_current_ua(CALIBRATION_CHANNEL_B,
+                                                        measurement->bus_mv,
+                                                        measurement->current_ua);
+    if (current_ua >= 0) return (int32_t)((current_ua + 500LL) / 1000LL);
+    return (int32_t)((current_ua - 500LL) / 1000LL);
 }
 
 static int32_t s_trim_mv;
@@ -194,16 +217,53 @@ static int32_t s_trim_mv;
 static uint16_t corrected_target_mv(uint16_t target_mv,
                                     bool output_enabled,
                                     bool current_limit_active,
-                                    const app_ina238_channel_t *measurement)
+                                    const app_ina238_channel_t *measurement,
+                                    int64_t now_us,
+                                    bool setpoint_changed)
 {
 #if OUTPUT_VOLTAGE_TRIM_ENABLED
-    if (!output_enabled) {
+    if (calibration_running()) {
         s_trim_mv = 0;
+        s_trim_hold_until_us = 0;
+        s_trim_arm_count = 0;
+        s_trim_armed = false;
         return target_mv;
     }
 
-    if (measurement->valid && !current_limit_active) {
-        int32_t error_mv = (int32_t)target_mv - (int32_t)measurement->bus_mv;
+    if (!output_enabled) {
+        s_trim_mv = 0;
+        s_trim_hold_until_us = 0;
+        s_trim_arm_count = 0;
+        s_trim_armed = false;
+        return target_mv;
+    }
+
+    if (setpoint_changed) {
+        s_trim_mv = 0;
+        s_trim_hold_until_us = now_us + 500000LL;
+        s_trim_arm_count = 0;
+        s_trim_armed = false;
+    }
+
+    int32_t error_mv = 0;
+    bool measurement_ready = now_us >= s_trim_hold_until_us &&
+                             measurement->valid &&
+                             !current_limit_active;
+    if (measurement_ready) {
+        error_mv = (int32_t)target_mv - (int32_t)measurement->bus_mv;
+        int32_t abs_error_mv = error_mv < 0 ? -error_mv : error_mv;
+        if (!s_trim_armed) {
+            if (abs_error_mv <= CHANNEL_B_TRIM_ARM_ERROR_MV) {
+                if (s_trim_arm_count < CHANNEL_B_TRIM_ARM_SAMPLES) ++s_trim_arm_count;
+                if (s_trim_arm_count >= CHANNEL_B_TRIM_ARM_SAMPLES) s_trim_armed = true;
+            } else {
+                s_trim_arm_count = 0;
+            }
+        }
+    }
+
+    bool trim_active = measurement_ready && s_trim_armed;
+    if (trim_active && measurement->valid && !current_limit_active) {
         if (error_mv > OUTPUT_VOLTAGE_TRIM_DEADBAND_MV ||
             error_mv < -OUTPUT_VOLTAGE_TRIM_DEADBAND_MV) {
             int32_t step_mv = error_mv / OUTPUT_VOLTAGE_TRIM_GAIN_DIV;
@@ -218,13 +278,16 @@ static uint16_t corrected_target_mv(uint16_t target_mv,
     }
 
     int32_t load_comp_mv = 0;
-    if (!current_limit_active) {
+    if (trim_active && !current_limit_active) {
         int32_t current_ma = measured_current_ma(measurement);
         if (current_ma < 0) current_ma = 0;
         load_comp_mv =
             (int32_t)(((int64_t)current_ma * CHANNEL_B_LOAD_COMP_MOHM + 500LL) / 1000LL);
     }
-    int32_t command_mv = (int32_t)target_mv + s_trim_mv + load_comp_mv;
+    int32_t command_mv = (int32_t)target_mv +
+                         calibration_voltage_correction_mv(CALIBRATION_CHANNEL_B, target_mv) +
+                         s_trim_mv +
+                         load_comp_mv;
     command_mv = clamp_s32(command_mv,
                            output_enabled ? LM51772_VOUT_LOW_MIN_MV : 0,
                            (int32_t)UINT16_MAX);
@@ -286,13 +349,14 @@ esp_err_t channelB_init(void)
     (void)update_bits(LM51772_REG_CONFIG_D9, LM51772_D9_SEL_ISET_PIN, 0);
     (void)update_bits(LM51772_REG_CONFIG_D8,
                       LM51772_D8_SEL_FB_DIV20,
-                      LM51772_FIXED_DIV20_BIT);
+                      0U);
     (void)write_u8(LM51772_REG_CUR_LIM, 0);
     (void)write_u8(LM51772_REG_VOUT_LSB, 0);
     (void)write_u8(LM51772_REG_VOUT_MSB, 0);
     s_output_programmed = false;
     s_last_output_enabled = false;
     s_last_command_mv = 0U;
+    s_last_div20 = false;
     s_trim_mv = 0;
     return ESP_OK;
 }
@@ -312,6 +376,7 @@ void channelB_i2c_release(void)
     s_output_programmed = false;
     s_last_output_enabled = false;
     s_last_command_mv = 0U;
+    s_last_div20 = false;
     s_trim_mv = 0;
 }
 
@@ -331,11 +396,16 @@ void channelB_update(app_state_t *state, int64_t now_us, bool channel_enabled)
     uint16_t target_ma = state->control.i1_ma;
     if (target_ma > CHANNEL_B_CURRENT_LIMIT_MAX_MA) target_ma = CHANNEL_B_CURRENT_LIMIT_MAX_MA;
     bool output_enabled = channel_enabled && target_mv >= LM51772_VOUT_LOW_MIN_MV;
+    bool setpoint_changed = target_mv != s_last_target_mv ||
+                            target_ma != s_last_target_ma ||
+                            output_enabled != s_last_output_enabled;
     uint16_t command_mv = corrected_target_mv(target_mv,
                                               output_enabled,
                                               state->lm51772.current_limit_active,
-                                              &state->ina238.channel[1]);
-    bool div20 = LM51772_FIXED_DIV20;
+                                              &state->ina238.channel[1],
+                                              now_us,
+                                              setpoint_changed);
+    bool div20 = select_div20(command_mv);
     uint16_t vout_code = voltage_to_code(command_mv, div20);
     uint8_t ilim_code = current_to_code(target_ma);
     uint16_t programmed_mv = code_to_voltage_mv(vout_code, div20);
@@ -361,15 +431,20 @@ void channelB_update(app_state_t *state, int64_t now_us, bool channel_enabled)
         s_last_target_mv = target_mv;
         s_last_target_ma = target_ma;
         s_last_command_mv = command_mv;
+        s_last_div20 = div20;
         s_last_output_enabled = false;
         s_output_programmed = true;
     } else if (!s_output_programmed ||
                target_mv != s_last_target_mv ||
                target_ma != s_last_target_ma ||
                command_mv != s_last_command_mv ||
+               div20 != s_last_div20 ||
                output_enabled != s_last_output_enabled) {
         esp_err_t err = ESP_OK;
         if ((err = update_bits(LM51772_REG_CONFIG_D9, LM51772_D9_SEL_ISET_PIN, 0)) != ESP_OK ||
+            (err = update_bits(LM51772_REG_CONFIG_D8,
+                               LM51772_D8_SEL_FB_DIV20,
+                               div20 ? LM51772_FIXED_DIV20_BIT : 0U)) != ESP_OK ||
             (err = write_u8(LM51772_REG_CUR_LIM, ilim_code)) != ESP_OK ||
             (err = write_u8(LM51772_REG_VOUT_LSB, vout_lsb)) != ESP_OK ||
             (err = write_u8(LM51772_REG_VOUT_MSB, vout_msb)) != ESP_OK ||
@@ -391,6 +466,7 @@ void channelB_update(app_state_t *state, int64_t now_us, bool channel_enabled)
         s_last_target_mv = target_mv;
         s_last_target_ma = target_ma;
         s_last_command_mv = command_mv;
+        s_last_div20 = div20;
         s_last_output_enabled = output_enabled;
         s_output_programmed = true;
     }

@@ -2,14 +2,17 @@
 #include <string.h>
 #include "bluetooth_spp.h"
 #include "buzzer.h"
+#include "calibration.h"
 #include "can_probe.h"
 #include "channelA.h"
 #include "channelB.h"
 #include "control.h"
 #include "display.h"
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -95,12 +98,60 @@ static int64_t s_command_line_last_us;
 static app_state_t s_state;
 static bool s_i2c_i2s_sniffer_active;
 static app_mode_t s_i2c_gpio_configured_mode = APP_MODE_POWER_SUPPLY;
+static app_mode_t s_bluetooth_configured_mode = APP_MODE_POWER_SUPPLY;
+
+static void bluetooth_command(char command);
+
+#define BOOT_STAGE_MAGIC 0xD0952001UL
+
+typedef enum {
+    BOOT_STAGE_UNKNOWN = 0,
+    BOOT_STAGE_APP_MAIN,
+    BOOT_STAGE_NVS_OK,
+    BOOT_STAGE_IO23_CONFIGURED_INACTIVE,
+    BOOT_STAGE_IO23_ON,
+    BOOT_STAGE_IO23_ON_DONE,
+    BOOT_STAGE_BT_INIT,
+    BOOT_STAGE_BT_INIT_DONE,
+    BOOT_STAGE_DISPLAY_INIT,
+    BOOT_STAGE_I2C_INIT,
+    BOOT_STAGE_RUN,
+} boot_stage_t;
+
+static RTC_NOINIT_ATTR uint32_t s_boot_stage_magic;
+static RTC_NOINIT_ATTR uint32_t s_boot_stage;
+
+static const char *boot_stage_name(uint32_t stage)
+{
+    switch ((boot_stage_t)stage) {
+        case BOOT_STAGE_APP_MAIN:                 return "APP_MAIN";
+        case BOOT_STAGE_NVS_OK:                   return "NVS_OK";
+        case BOOT_STAGE_IO23_CONFIGURED_INACTIVE: return "IO23_CONFIGURED_INACTIVE";
+        case BOOT_STAGE_IO23_ON:                  return "IO23_ON";
+        case BOOT_STAGE_IO23_ON_DONE:             return "IO23_ON_DONE";
+        case BOOT_STAGE_BT_INIT:                  return "BT_INIT";
+        case BOOT_STAGE_BT_INIT_DONE:             return "BT_INIT_DONE";
+        case BOOT_STAGE_DISPLAY_INIT:             return "DISPLAY_INIT";
+        case BOOT_STAGE_I2C_INIT:                 return "I2C_INIT";
+        case BOOT_STAGE_RUN:                      return "RUN";
+        default:                                  return "UNKNOWN";
+    }
+}
+
+static void boot_stage_set(boot_stage_t stage)
+{
+    s_boot_stage_magic = BOOT_STAGE_MAGIC;
+    s_boot_stage = (uint32_t)stage;
+}
 
 static int64_t measured_current_ua(char channel, const app_ina238_channel_t *measurement)
 {
     if (measurement == NULL || !measurement->valid || measurement->shunt_uohm == 0U) return 0;
-    int64_t current_ua = ((int64_t)measurement->shunt_uv * 1000000LL) /
-                         (int64_t)measurement->shunt_uohm;
+    int64_t current_ua = measurement->current_ua;
+    uint8_t cal_channel = channel == 'A' ? CALIBRATION_CHANNEL_A : CALIBRATION_CHANNEL_B;
+    if (calibration_current_available(cal_channel)) {
+        return calibration_correct_current_ua(cal_channel, measurement->bus_mv, current_ua);
+    }
     if (channel == 'A') {
         current_ua -= ((int64_t)measurement->bus_mv * CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_NUM +
                        CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_DEN / 2LL) /
@@ -113,7 +164,9 @@ static void power_telemetry_update(const app_state_t *state, int64_t now_us)
 {
     static int64_t last_telemetry_us;
 
-    if (state->control.mode != APP_MODE_POWER_SUPPLY || !bluetooth_spp_connected()) {
+    if (state == NULL ||
+        state->control.mode != APP_MODE_1WIRE ||
+        !bluetooth_spp_connected()) {
         last_telemetry_us = now_us;
         return;
     }
@@ -132,6 +185,170 @@ static void power_telemetry_update(const app_state_t *state, int64_t now_us)
                           (long long)ia_ua,
                           (long long)ib_ua);
     if (length > 0) bluetooth_spp_write(line, (size_t)length);
+}
+
+static void bluetooth_mode_update(app_mode_t mode)
+{
+    static int64_t next_init_retry_us;
+    static int64_t next_deinit_retry_us;
+    int64_t now_us = esp_timer_get_time();
+
+    if (mode == APP_MODE_POWER_SUPPLY) {
+        if (!bluetooth_spp_initialized()) {
+            s_bluetooth_configured_mode = APP_MODE_POWER_SUPPLY;
+            return;
+        }
+        if (s_bluetooth_configured_mode == APP_MODE_POWER_SUPPLY && now_us < next_deinit_retry_us) {
+            return;
+        }
+        esp_err_t result = bluetooth_spp_deinit();
+        s_bluetooth_configured_mode = APP_MODE_POWER_SUPPLY;
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "Bluetooth deinit: %s", esp_err_to_name(result));
+            next_deinit_retry_us = now_us + 1000000LL;
+        } else {
+            ESP_LOGI(TAG, "Bluetooth off in Power Source");
+            next_deinit_retry_us = now_us;
+        }
+        return;
+    }
+
+    if (!bluetooth_spp_initialized()) {
+        if (now_us < next_init_retry_us) return;
+        boot_stage_set(BOOT_STAGE_BT_INIT);
+        esp_err_t result = bluetooth_spp_init(bluetooth_command);
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "Bluetooth init: %s", esp_err_to_name(result));
+            next_init_retry_us = now_us + 1000000LL;
+            return;
+        } else {
+            ESP_LOGI(TAG, "Bluetooth device: %s", bluetooth_spp_device_name());
+        }
+        boot_stage_set(BOOT_STAGE_BT_INIT_DONE);
+    }
+
+    s_bluetooth_configured_mode = mode;
+}
+
+static const char *mode_hint_text(app_mode_t mode)
+{
+    switch (mode) {
+        case APP_MODE_UART:
+            return "[UART HINT] ASCII mode only. BT input -> UART TX. UART RX text preview -> [UART]. Select baud on screen.\r\n";
+        case APP_MODE_LIN:
+            return "[LIN HINT] Sniffer only. Select baud/mask on screen. RX -> [LIN]P:<PID> <data...> CRC_CL:OK/CRC_ENH:OK/PAR:ERR/CRC:ERR.\r\n";
+        case APP_MODE_CAN:
+            return "[CAN HINT] Send ASCII HEX: 4 ID digits + 0..8 data bytes. Example 0404112233 -> ID 0x404 data 11 22 33. RX -> [CAN].\r\n";
+        case APP_MODE_RS485:
+            return "[RS485 HINT] Send byte values as HEX. RX -> [485] HEX. Select baud on screen.\r\n";
+        case APP_MODE_I2C:
+            return "[I2C SNIFF HINT] Sniffer only. Select mask on screen: -- all, 4- = 0x40..0x4F, 41 = only 0x41. RX -> [I2C].\r\n";
+        case APP_MODE_I2C_MASTER:
+            return "[I2C MASTER HINT] ASCII commands: S | R addr reg len | W addr reg data... | RR addr len | WW addr data... . addr/reg/data HEX, len decimal.\r\n";
+        default:
+            return NULL;
+    }
+}
+
+static void mode_hint_update(app_mode_t mode)
+{
+    static app_mode_t hinted_mode = APP_MODE_POWER_SUPPLY;
+    static bool hint_sent;
+    static bool bt_was_connected;
+
+    bool bt_connected = bluetooth_spp_connected();
+    bool mode_changed = mode != hinted_mode;
+    bool connected_now = bt_connected && !bt_was_connected;
+
+    if (mode == APP_MODE_POWER_SUPPLY) {
+        hinted_mode = mode;
+        hint_sent = false;
+        bt_was_connected = bt_connected;
+        return;
+    }
+
+    if (mode_changed) {
+        hinted_mode = mode;
+        hint_sent = false;
+    }
+
+    if (bt_connected && !hint_sent && (mode_changed || connected_now)) {
+        const char *hint = mode_hint_text(mode);
+        if (hint != NULL) {
+            bluetooth_spp_write(hint, strlen(hint));
+        }
+        hint_sent = true;
+    }
+
+    if (!bt_connected) hint_sent = false;
+    bt_was_connected = bt_connected;
+}
+
+static void warning_tone_update(const app_state_t *state, int64_t now_us)
+{
+    static bool overheat_latched;
+    static bool overpower_latched;
+    static int64_t next_overheat_us;
+    static int64_t next_overpower_us;
+
+    const app_ina238_channel_t *a = &state->ina238.channel[0];
+    const app_ina238_channel_t *b = &state->ina238.channel[1];
+
+    bool temperature_valid = a->valid || b->valid;
+    int32_t max_temperature_mc = 0;
+    if (a->valid && b->valid) {
+        max_temperature_mc = a->temperature_mc > b->temperature_mc ?
+                             a->temperature_mc : b->temperature_mc;
+    } else if (a->valid) {
+        max_temperature_mc = a->temperature_mc;
+    } else if (b->valid) {
+        max_temperature_mc = b->temperature_mc;
+    }
+
+    int32_t overheat_on_mc = (int32_t)state->control.overheat_c * 1000;
+    int32_t overheat_off_mc = overheat_on_mc - 1000;
+    if (temperature_valid && max_temperature_mc >= overheat_on_mc) {
+        overheat_latched = true;
+    } else if (!temperature_valid || max_temperature_mc <= overheat_off_mc) {
+        overheat_latched = false;
+        next_overheat_us = now_us;
+    }
+
+    int64_t total_power_mw = 0;
+    if (a->valid && state->control.channel_a_enabled) {
+        int64_t current_ua = measured_current_ua('A', a);
+        if (current_ua > 0) total_power_mw += ((int64_t)a->bus_mv * current_ua) / 1000000LL;
+    }
+    if (b->valid && state->control.channel_b_enabled) {
+        int64_t current_ua = measured_current_ua('B', b);
+        if (current_ua > 0) total_power_mw += ((int64_t)b->bus_mv * current_ua) / 1000000LL;
+    }
+
+    if (state->control.overpower_w == 0U) {
+        overpower_latched = false;
+        next_overpower_us = now_us;
+    } else {
+        int64_t overpower_on_mw = (int64_t)state->control.overpower_w * 1000LL;
+        int64_t overpower_off_mw = overpower_on_mw - 5000LL;
+        if (overpower_off_mw < 0) overpower_off_mw = 0;
+        if (total_power_mw >= overpower_on_mw) {
+            overpower_latched = true;
+        } else if (total_power_mw <= overpower_off_mw) {
+            overpower_latched = false;
+            next_overpower_us = now_us;
+        }
+    }
+
+    if (overpower_latched && now_us >= next_overpower_us) {
+        buzzer_play_overpower_warning(state->control.volume_percent);
+        next_overpower_us = now_us + 3000000LL;
+        return;
+    }
+
+    if (overheat_latched && now_us >= next_overheat_us) {
+        buzzer_play_overheat_warning(state->control.volume_percent);
+        next_overheat_us = now_us + 5000000LL;
+    }
 }
 
 static uint64_t gpio_output_mask(gpio_num_t gpio)
@@ -159,15 +376,23 @@ static esp_err_t board_power_init(void)
     ESP_LOGI(TAG, "peripheral power gpio %d inactive level %d",
              (int)BOARD_PERIPHERAL_POWER_GPIO,
              inactive_level);
+    boot_stage_set(BOOT_STAGE_IO23_CONFIGURED_INACTIVE);
+    return ESP_OK;
+}
+
+static void board_power_enable(void)
+{
+    if (BOARD_PERIPHERAL_POWER_GPIO == GPIO_NUM_NC) return;
 #if BOARD_PERIPHERAL_POWER_AUTO_ENABLE
+    boot_stage_set(BOOT_STAGE_IO23_ON);
     ESP_LOGI(TAG, "peripheral power gpio %d active level %d",
              (int)BOARD_PERIPHERAL_POWER_GPIO,
              BOARD_PERIPHERAL_POWER_ACTIVE_LEVEL);
     gpio_set_level(BOARD_PERIPHERAL_POWER_GPIO, BOARD_PERIPHERAL_POWER_ACTIVE_LEVEL);
+    boot_stage_set(BOOT_STAGE_IO23_ON_DONE);
 #else
     ESP_LOGW(TAG, "peripheral power auto enable disabled");
 #endif
-    return ESP_OK;
 }
 
 /* enqueue_command
@@ -344,7 +569,15 @@ static void process_command_char(char command)
  */
 void app_main(void)
 {
+    uint32_t previous_stage = s_boot_stage_magic == BOOT_STAGE_MAGIC ?
+                              s_boot_stage : BOOT_STAGE_UNKNOWN;
+    esp_reset_reason_t reset_reason = esp_reset_reason();
     ESP_LOGI(TAG, "boot Logic_v2 app_main");
+    ESP_LOGI(TAG,
+             "reset reason=%d previous boot stage=%s",
+             (int)reset_reason,
+             boot_stage_name(previous_stage));
+    boot_stage_set(BOOT_STAGE_APP_MAIN);
     esp_err_t nvs = nvs_flash_init();
     if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -352,10 +585,14 @@ void app_main(void)
     } else {
         ESP_ERROR_CHECK(nvs);
     }
+    boot_stage_set(BOOT_STAGE_NVS_OK);
     ESP_ERROR_CHECK(board_power_init());
+    calibration_load();
 
     s_commands = xQueueCreate(64, sizeof(char));
     xTaskCreate(uart_command_task, "uart_cmd", 3072, NULL, 4, NULL);
+
+    board_power_enable();
 
     memset(&s_state, 0, sizeof(s_state));
     s_state.analog.logic_state = PROBE_UNDEFINED;
@@ -370,6 +607,7 @@ void app_main(void)
     ESP_ERROR_CHECK(analog_probe_init());
 #endif
     ESP_LOGI(TAG, "display_init begin");
+    boot_stage_set(BOOT_STAGE_DISPLAY_INIT);
     ESP_ERROR_CHECK(display_init());
     ESP_LOGI(TAG, "display_init end");
 #if IO26_DIAG_ENABLED
@@ -404,6 +642,7 @@ void app_main(void)
     ESP_ERROR_CHECK(control_init());
     ESP_LOGI(TAG, "control_init end");
     ESP_LOGI(TAG, "ina238_monitor_init begin");
+    boot_stage_set(BOOT_STAGE_I2C_INIT);
     ESP_ERROR_CHECK(ina238_monitor_init());
     ESP_LOGI(TAG, "ina238_monitor_init end");
     ESP_LOGI(TAG, "channelA_init begin");
@@ -416,13 +655,10 @@ void app_main(void)
     ESP_ERROR_CHECK(i2c_worker_start(&s_state));
     ESP_LOGI(TAG, "i2c_worker_start end");
 
-    esp_err_t bt_result = bluetooth_spp_init(bluetooth_command);
-    if (bt_result != ESP_OK) ESP_LOGE(TAG, "Bluetooth init: %s", esp_err_to_name(bt_result));
-    else ESP_LOGI(TAG, "Bluetooth device: %s", bluetooth_spp_device_name());
-
     int64_t last_ui_us = 0;
     display_black();
     ESP_LOGI(TAG, "enter main loop");
+    boot_stage_set(BOOT_STAGE_RUN);
 
     while (true) {
         int64_t now = esp_timer_get_time();
@@ -433,6 +669,8 @@ void app_main(void)
         analog_probe_update(&s_state, false);
 #endif
         control_update(&s_state);
+        bluetooth_mode_update(s_state.control.mode);
+        mode_hint_update(s_state.control.mode);
 #if UART_PROBE_ENABLED && !I2C_SNIFFER_OWNS_UART_PINS
         uart_probe_configure(s_state.control.mode,
                              s_state.control.uart_baud,
@@ -485,6 +723,8 @@ void app_main(void)
                             s_state.control.can_mask_care);
         can_probe_update(&s_state, now);
         control_persistence_update(now);
+        buzzer_set_volume(s_state.control.volume_percent);
+        warning_tone_update(&s_state, now);
         buzzer_update();
         power_telemetry_update(&s_state, now);
 

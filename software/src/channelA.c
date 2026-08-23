@@ -1,7 +1,9 @@
 #include "channelA.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+#include "calibration.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "i2c_bus.h"
@@ -49,6 +51,9 @@
 #define TPS55289_MODE_FPWM              0x02U
 #define TPS55289_STATUS_OCP             0x40U
 #define TPS55289_VOUT_SR_FAST_OCP       0x01U /* OCP_DELAY=00 (128 us), SR=01 */
+#define CHANNEL_A_TRIM_ARM_ERROR_MV     300
+#define CHANNEL_A_TRIM_ARM_SAMPLES      3U
+#define CHANNEL_A_I2C_TIMEOUT_MS        8
 
 static i2c_master_dev_handle_t s_tps;
 static i2c_master_dev_handle_t s_mcp4725;
@@ -59,6 +64,9 @@ static uint16_t s_last_target_mv;
 static uint16_t s_last_target_ma;
 static uint16_t s_last_command_mv;
 static int32_t s_trim_mv;
+static int64_t s_trim_hold_until_us;
+static uint8_t s_trim_arm_count;
+static bool s_trim_armed;
 
 /* write_u8
  * Inputs: register address and byte value.
@@ -73,7 +81,7 @@ static esp_err_t write_u8(uint8_t reg, uint8_t value)
         ++debug_log_count;
         ESP_LOGI(TAG, "I2C_TX TPS W %02X %02X %02X", TPS55289_ADDRESS, reg, value);
     }
-    return i2c_master_transmit(s_tps, bytes, sizeof(bytes), 100);
+    return i2c_master_transmit(s_tps, bytes, sizeof(bytes), CHANNEL_A_I2C_TIMEOUT_MS);
 }
 
 /* write_ref
@@ -103,7 +111,12 @@ static esp_err_t read_u8(uint8_t reg, uint8_t *value)
         ++debug_log_count;
         ESP_LOGI(TAG, "I2C_TX TPS R %02X %02X", TPS55289_ADDRESS, reg);
     }
-    return i2c_master_transmit_receive(s_tps, &reg, 1, value, 1, 100);
+    return i2c_master_transmit_receive(s_tps,
+                                       &reg,
+                                       1,
+                                       value,
+                                       1,
+                                       CHANNEL_A_I2C_TIMEOUT_MS);
 }
 
 /* write_mcp4725
@@ -125,7 +138,7 @@ static esp_err_t write_mcp4725(uint16_t code)
         ++debug_log_count;
         ESP_LOGI(TAG, "I2C_TX MCP W %02X %02X %02X", CHANNEL_A_MCP4725_ADDRESS, bytes[0], bytes[1]);
     }
-    return i2c_master_transmit(s_mcp4725, bytes, sizeof(bytes), 100);
+    return i2c_master_transmit(s_mcp4725, bytes, sizeof(bytes), CHANNEL_A_I2C_TIMEOUT_MS);
 }
 
 /* clamp_tps_voltage_mv
@@ -168,6 +181,65 @@ static uint8_t current_to_limit_code(uint16_t target_ma)
     return (uint8_t)code;
 }
 
+typedef struct {
+    uint16_t measured_ma;
+    uint16_t command_ma;
+} channelA_limit_cal_point_t;
+
+static const channelA_limit_cal_point_t s_limit_cal[] = {
+    {10U, 100U},
+    {44U, 150U},
+    {100U, 200U},
+    {178U, 300U},
+    {255U, 400U},
+    {339U, 500U},
+    {425U, 600U},
+    {512U, 700U},
+    {597U, 800U},
+    {683U, 900U},
+    {767U, 1000U},
+    {852U, 1100U},
+    {938U, 1200U},
+    {966U, 1300U},
+};
+
+/* corrected_current_limit_ma
+ * Inputs: requested real current limit in milliamps.
+ * Returns: TPS55289 current-limit command in milliamps.
+ * Does: compensates the measured TPS55289 current-limit error. The table is
+ * inverse: measured limit -> command that produced it. Intermediate user
+ * values are linearly interpolated; values above the measured region are
+ * extrapolated from the stable mid-range gain.
+ */
+static uint16_t corrected_current_limit_ma(uint16_t target_ma)
+{
+    if (target_ma == 0U) return 0U;
+
+    const size_t count = sizeof(s_limit_cal) / sizeof(s_limit_cal[0]);
+    if (target_ma <= s_limit_cal[0].measured_ma) {
+        return s_limit_cal[0].command_ma;
+    }
+
+    for (size_t i = 1U; i < count; ++i) {
+        const channelA_limit_cal_point_t *low = &s_limit_cal[i - 1U];
+        const channelA_limit_cal_point_t *high = &s_limit_cal[i];
+        if (target_ma <= high->measured_ma) {
+            uint32_t measured_span = (uint32_t)high->measured_ma - low->measured_ma;
+            uint32_t command_span = (uint32_t)high->command_ma - low->command_ma;
+            uint32_t measured_delta = (uint32_t)target_ma - low->measured_ma;
+            return (uint16_t)(low->command_ma +
+                              (measured_delta * command_span + measured_span / 2U) /
+                              measured_span);
+        }
+    }
+
+    uint32_t extra_ma = (uint32_t)target_ma - s_limit_cal[count - 1U].measured_ma;
+    uint32_t command_ma = (uint32_t)s_limit_cal[count - 1U].command_ma +
+                          (extra_ma * 10000U + 4212U) / 8425U;
+    if (command_ma > UINT16_MAX) command_ma = UINT16_MAX;
+    return (uint16_t)command_ma;
+}
+
 /* limit_code_to_current_ma
  * Inputs: TPS55289 IOUT_LIMIT code without enable bit.
  * Returns: quantized current limit represented by the code.
@@ -190,27 +262,70 @@ static int32_t clamp_s32(int32_t value, int32_t min_value, int32_t max_value)
 static int32_t measured_current_ma(const app_ina238_channel_t *measurement)
 {
     if (!measurement->valid || measurement->shunt_uohm == 0U) return 0;
-    int64_t current_ua = ((int64_t)measurement->shunt_uv * 1000000LL) /
-                         (int64_t)measurement->shunt_uohm;
-    current_ua -= ((int64_t)measurement->bus_mv * CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_NUM +
-                   CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_DEN / 2LL) /
-                  CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_DEN;
-    return (int32_t)(current_ua / 1000LL);
+    int64_t current_ua = measurement->current_ua;
+    if (calibration_current_available(CALIBRATION_CHANNEL_A)) {
+        current_ua = calibration_correct_current_ua(CALIBRATION_CHANNEL_A,
+                                                    measurement->bus_mv,
+                                                    current_ua);
+    } else {
+        current_ua -= ((int64_t)measurement->bus_mv * CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_NUM +
+                       CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_DEN / 2LL) /
+                      CHANNEL_A_DIVIDER_LEAK_UA_PER_MV_DEN;
+    }
+    if (current_ua >= 0) return (int32_t)((current_ua + 500LL) / 1000LL);
+    return (int32_t)((current_ua - 500LL) / 1000LL);
 }
 
 static uint16_t corrected_target_mv(uint16_t target_mv,
                                     bool output_enabled,
                                     bool current_limit_active,
-                                    const app_ina238_channel_t *measurement)
+                                    const app_ina238_channel_t *measurement,
+                                    int64_t now_us,
+                                    bool setpoint_changed)
 {
 #if OUTPUT_VOLTAGE_TRIM_ENABLED
-    if (!output_enabled) {
+    if (calibration_running()) {
         s_trim_mv = 0;
+        s_trim_hold_until_us = 0;
+        s_trim_arm_count = 0;
+        s_trim_armed = false;
         return target_mv;
     }
 
-    if (measurement->valid && !current_limit_active) {
-        int32_t error_mv = (int32_t)target_mv - (int32_t)measurement->bus_mv;
+    if (!output_enabled) {
+        s_trim_mv = 0;
+        s_trim_hold_until_us = 0;
+        s_trim_arm_count = 0;
+        s_trim_armed = false;
+        return target_mv;
+    }
+
+    if (setpoint_changed) {
+        s_trim_mv = 0;
+        s_trim_hold_until_us = now_us + 500000LL;
+        s_trim_arm_count = 0;
+        s_trim_armed = false;
+    }
+
+    int32_t error_mv = 0;
+    bool measurement_ready = now_us >= s_trim_hold_until_us &&
+                             measurement->valid &&
+                             !current_limit_active;
+    if (measurement_ready) {
+        error_mv = (int32_t)target_mv - (int32_t)measurement->bus_mv;
+        int32_t abs_error_mv = error_mv < 0 ? -error_mv : error_mv;
+        if (!s_trim_armed) {
+            if (abs_error_mv <= CHANNEL_A_TRIM_ARM_ERROR_MV) {
+                if (s_trim_arm_count < CHANNEL_A_TRIM_ARM_SAMPLES) ++s_trim_arm_count;
+                if (s_trim_arm_count >= CHANNEL_A_TRIM_ARM_SAMPLES) s_trim_armed = true;
+            } else {
+                s_trim_arm_count = 0;
+            }
+        }
+    }
+
+    bool trim_active = measurement_ready && s_trim_armed;
+    if (trim_active && measurement->valid && !current_limit_active) {
         if (error_mv > OUTPUT_VOLTAGE_TRIM_DEADBAND_MV ||
             error_mv < -OUTPUT_VOLTAGE_TRIM_DEADBAND_MV) {
             int32_t step_mv = error_mv / OUTPUT_VOLTAGE_TRIM_GAIN_DIV;
@@ -225,16 +340,19 @@ static uint16_t corrected_target_mv(uint16_t target_mv,
     }
 
     int32_t load_comp_mv = 0;
-    if (!current_limit_active) {
+    if (trim_active && !current_limit_active) {
         int32_t current_ma = measured_current_ma(measurement);
         if (current_ma < 0) current_ma = 0;
         load_comp_mv =
             (int32_t)(((int64_t)current_ma * CHANNEL_A_LOAD_COMP_MOHM + 500LL) / 1000LL);
     }
-    int32_t command_mv = (int32_t)target_mv + s_trim_mv + load_comp_mv;
+    int32_t command_mv = (int32_t)target_mv +
+                         calibration_voltage_correction_mv(CALIBRATION_CHANNEL_A, target_mv) +
+                         s_trim_mv +
+                         load_comp_mv;
     command_mv = clamp_s32(command_mv,
                            0,
-                           (int32_t)UINT16_MAX - (int32_t)CHANNEL_A_LDO_OFFSET_MV);
+                           (int32_t)UINT16_MAX - (int32_t)CHANNEL_A_LDO_HEADROOM_LOW_MV);
     return (uint16_t)command_mv;
 #else
     (void)output_enabled;
@@ -242,6 +360,14 @@ static uint16_t corrected_target_mv(uint16_t target_mv,
     (void)measurement;
     return target_mv;
 #endif
+}
+
+static uint16_t channelA_ldo_headroom_mv(uint16_t channel_target_mv)
+{
+    if (channel_target_mv > CHANNEL_A_LDO_HEADROOM_SWITCH_MV) {
+        return CHANNEL_A_LDO_HEADROOM_HIGH_MV;
+    }
+    return CHANNEL_A_LDO_HEADROOM_LOW_MV;
 }
 
 typedef struct {
@@ -270,7 +396,7 @@ static int64_t round_div_s64(int64_t numerator, int64_t denominator)
  * Inputs: DAC output voltage in millivolts.
  * Returns: expected LDO output voltage in millivolts.
  * Does: solves the TPS73801 feedback-node KCL for the actual output voltage
- * that the 20k/2k/3.6k network will request.
+ * that the configured 20k/2k/Rdac network will request.
  */
 static uint16_t ldo_output_from_dac_mv(uint16_t dac_mv)
 {
@@ -294,7 +420,7 @@ static uint16_t ldo_output_from_dac_mv(uint16_t dac_mv)
  * Returns: DAC code and expected LDO output.
  * Does: commands the auxiliary TPS73801 LDO to U2 using:
  *
- *   (Vout - Vfb) / 20k + (Vdac - Vfb) / 3.6k = Vfb / 2k
+ *   (Vout - Vfb) / Rtop + (Vdac - Vfb) / Rdac = Vfb / Rbottom
  *
  * DAC voltage is clamped to the real MCP4725 output range, and the saturated
  * flag tells the UI/telemetry that the requested LDO output is outside what
@@ -396,7 +522,8 @@ esp_err_t channelA_init(void)
     (void)write_u8(TPS55289_REG_VOUT_FS, TPS55289_VOUT_FS_INTFB_20V);
     (void)write_ref(voltage_to_ref_code(TPS55289_REF_MIN_MV));
     (void)write_u8(TPS55289_REG_IOUT_LIMIT,
-                   (uint8_t)(TPS55289_ILIM_ENABLE | current_to_limit_code(0)));
+                   (uint8_t)(TPS55289_ILIM_ENABLE |
+                             current_to_limit_code(0)));
     (void)write_u8(TPS55289_REG_VOUT_SR, TPS55289_VOUT_SR_FAST_OCP);
     s_output_programmed = false;
     s_last_output_enabled = false;
@@ -443,15 +570,22 @@ void channelA_update(app_state_t *state, int64_t now_us, bool channel_enabled)
     uint16_t target_mv = state->control.u2_mv;
     uint16_t target_ma = state->control.i2_ma;
     bool output_enabled = channel_enabled && target_mv != 0U;
+    bool setpoint_changed = target_mv != s_last_target_mv ||
+                            target_ma != s_last_target_ma ||
+                            output_enabled != s_last_output_enabled;
     uint16_t command_mv = corrected_target_mv(target_mv,
                                               output_enabled,
                                               state->tps55289.current_limit_active,
-                                              &state->ina238.channel[0]);
-    uint16_t tps_target_mv = command_mv == 0U ? 0U : (uint16_t)(command_mv + CHANNEL_A_LDO_OFFSET_MV);
+                                              &state->ina238.channel[0],
+                                              now_us,
+                                              setpoint_changed);
+    uint16_t tps_target_mv = command_mv == 0U ? 0U :
+                             (uint16_t)(command_mv + channelA_ldo_headroom_mv(command_mv));
     uint16_t programmed_mv = clamp_tps_voltage_mv(tps_target_mv);
     channelA_ldo_dac_t ldo = calculate_ldo_dac(command_mv);
 
-    uint8_t ilim_code = current_to_limit_code(target_ma);
+    uint16_t limit_command_ma = corrected_current_limit_ma(target_ma);
+    uint8_t ilim_code = current_to_limit_code(limit_command_ma);
     uint16_t programmed_ma = limit_code_to_current_ma(ilim_code);
 
     publish_state(state, target_mv, target_ma, programmed_mv, programmed_ma, output_enabled, &ldo);
