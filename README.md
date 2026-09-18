@@ -119,13 +119,15 @@ for build updates, tests, limitations, and design progress.
   <tr>
     <td align="center">Assembled prototype — bottom view</td>
     <td align="center">Power board — top-angle close-up</td>
+    <td align="center">Control board — front view</td>
+    <td align="center">Control board — rear view</td>
   </tr>
 </table>
 
 <table>
   <tr>
     <td width="25%">
-      <img src="assets/photos/can_display.png"
+      <img src="assets/photos/can_display.jpg"
            alt="DOGS² v1 CAN display">
     </td>
     <td width="25%">
@@ -142,8 +144,10 @@ for build updates, tests, limitations, and design progress.
     </td>
   </tr>
   <tr>
-    <td align="center">Assembled prototype — bottom view</td>
-    <td align="center">Power board — top-angle close-up</td>
+    <td align="center">CAN display</td>
+    <td align="center">LIN sniffer display</td>
+    <td align="center">I2C sniffer display</td>
+    <td align="center">Setting display</td>
   </tr>
 </table>
 
