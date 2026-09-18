@@ -78,7 +78,7 @@ for build updates, tests, limitations, and design progress.
 <table>
   <tr>
     <td width="33%">
-      <img src="assets/photos/menu_display.png"
+      <img src="assets/photos/menu_display.jpg"
            alt="DOGS² v1 engineering prototype menu">
     </td>
     <td width="33%">
