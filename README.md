@@ -82,8 +82,8 @@ for build updates, tests, limitations, and design progress.
            alt="DOGS² v1 engineering prototype menu">
     </td>
     <td width="33%">
-      <img src="assets/photos/power_source_display.jpg"
-           alt="DOGS² signal generator mode">
+      <img src="assets/photos/current_graph_display.jpg"
+           alt="DOGS² current graph">
     </td>
     <td width="33%">
       <img src="assets/photos/dogs2-rs485-test.png"
@@ -114,6 +114,31 @@ for build updates, tests, limitations, and design progress.
     <td width="25%">
       <img src="assets/photos/dogs2-control-panel-rear-components-angle.jpg"
            alt="DOGS² v1 control board rear">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">Assembled prototype — bottom view</td>
+    <td align="center">Power board — top-angle close-up</td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td width="25%">
+      <img src="assets/photos/can_display.png"
+           alt="DOGS² v1 CAN display">
+    </td>
+    <td width="25%">
+      <img src="assets/photos/lin_display.jpg"
+           alt="DOGS² v1 LIN sniffer display">
+    </td>
+    <td width="25%">
+      <img src="assets/photos/i2c_sniffer.jpg"
+           alt="DOGS² v1 I2C sniffer display">
+    </td>
+    <td width="25%">
+      <img src="assets/photos/setting_display.jpg"
+           alt="DOGS² v1 setting display">
     </td>
   </tr>
   <tr>
