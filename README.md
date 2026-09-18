@@ -55,6 +55,11 @@ signup, and follow the
 [development logs on Hackaday.io](https://hackaday.io/project/206311-dogs-dual-output-generator-supply-station)
 for build updates, tests, limitations, and design progress.
 
+## Known issues the Engineering samples
+
+Here is some known issues - read the files in directories Hardware and Mechanical.
+
+
 ## Repository structure
 
 | Directory | Contents |
