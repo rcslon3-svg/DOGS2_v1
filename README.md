@@ -135,7 +135,7 @@ for build updates, tests, limitations, and design progress.
            alt="DOGS² v1 LIN sniffer display">
     </td>
     <td width="25%">
-      <img src="assets/photos/i2c_sniffer.jpg"
+      <img src="assets/photos/i2c_sniffer_display.jpg"
            alt="DOGS² v1 I2C sniffer display">
     </td>
     <td width="25%">
