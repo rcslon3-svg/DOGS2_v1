@@ -15,10 +15,21 @@ The protrusion on the lower part of the enclosure above the USB connector openin
 |---|---|---:|
 | [`Front_v1_final_1.step`](Front_v1_final_1.step) | Front panel | 1 |
 | [`Bottom_v1_final_1.step`](Bottom_v1_final_1.step) | Enclosure base | 1 |
+| [`Top_case_v1_final_1.step`](Top_case_v1_final_1.step) | Enclosure top | 1 |
 | [`Button_v1_x3_final_1.step`](Button_v1_x3_final_1.step) | Front-panel button | 3 |
 
 ## Fabricated parts
 
+<p align="center">
+  <img src="1787485421207.jpg"
+       alt="Fabricated transparent DOGS² v1 enclosure parts: front panel, base, and three buttons"
+       width="650">
+</p>
+<p align="center">
+  <img src="1787485421207.jpg"
+       alt="Fabricated transparent DOGS² v1 enclosure parts: front panel, base, and three buttons"
+       width="650">
+</p>
 <p align="center">
   <img src="1787485421207.jpg"
        alt="Fabricated transparent DOGS² v1 enclosure parts: front panel, base, and three buttons"
