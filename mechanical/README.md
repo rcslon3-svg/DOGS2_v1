@@ -21,13 +21,13 @@ The protrusion on the lower part of the enclosure above the USB connector openin
 ## Fabricated parts
 
 <p align="center">
-  <img src="1787485421207.jpg"
-       alt="Fabricated transparent DOGS² v1 enclosure parts: front panel, base, and three buttons"
+  <img src="full_case.jpg"
+       alt="Fabricated transparent DOGS² v1 enclosure"
        width="650">
 </p>
 <p align="center">
-  <img src="1787485421207.jpg"
-       alt="Fabricated transparent DOGS² v1 enclosure parts: front panel, base, and three buttons"
+  <img src="top_case.jpg"
+       alt="Fabricated transparent DOGS² v1 enclosure parts: top case"
        width="650">
 </p>
 <p align="center">
