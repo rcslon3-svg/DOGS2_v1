@@ -5,6 +5,8 @@ board bring-up station. It combines two programmable power outputs, current and
 voltage monitoring, a signal generator, and common embedded-interface tools in
 one compact instrument.
 
+It is powered from USB Type-C or an external voltage of 5–90 V, with an output voltage of 1–48 V and a peak current of up to 5 amperes. Power anything from anything.
+
 <p align="center">
   <img src="assets/photos/start.jpg"
        alt="DOGS² v1 welcome screen"
@@ -17,18 +19,18 @@ one compact instrument.
        width="900">
 </p>
 
-- DC/DC power channel 1-48V / 5A peak with CV/CC operation, 50 uA current resolution;
-- LDO power channel 1.3-20V / 2A peak with CV/CC operation, 12.5 uA current resolution;
+- DC/DC power channel 1-48V / 5A peak with CV/CC/OCP Shutdown operation, 50 uA current resolution;
+- LDO power channel 1.3-20V / 2A peak with CV/CC/OCP Shutdown operation, 12.5 uA current resolution;
 - actual values voltage and current monitoring;
 - current graphics on display and phone app
-- square-wave generator;
+- square-wave generator 1Hz - 100 kHz with 3-20V output voltage;
 - UART and RS485 terminal modes;
 - CAN receive, filtering, and transmission;
 - LIN bus sniffer;
 - I2C sniffer and I2C master terminal;
-- analog probe and frequency meter input;
+- logic probe and frequency meter input;
 - standalone TFT display, encoder, and front-panel controls;
-- Bluetooth SPP command and telemetry (current graph) connection.
+- Bluetooth SPP terminal data, command and telemetry (current graph) connection.
 
 <p align="center">
   <strong><a href="https://dogs2.smartmoto.asia">Visit the DOGS² project website</a></strong><br>
