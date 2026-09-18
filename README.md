@@ -12,7 +12,7 @@ one compact instrument.
 </p>
 
 <p align="center">
-  <img src="assets/photos/in_hand.png"
+  <img src="assets/photos/in_hand.jpg"
        alt="DOGS² v1 working engineering prototype"
        width="900">
 </p>
@@ -99,19 +99,19 @@ for build updates, tests, limitations, and design progress.
 
 <table>
   <tr>
-    <td width="50%">
+    <td width="25%">
       <img src="assets/photos/dogs2-assembled-bottom.png"
            alt="DOGS² v1 assembled prototype viewed from below">
     </td>
-    <td width="50%">
+    <td width="25%">
       <img src="assets/photos/dogs2-power-board-top-angle-closeup.jpg"
            alt="DOGS² v1 power board top-angle close-up">
     </td>
-    <td width="50%">
+    <td width="25%">
       <img src="assets/photos/dogs2-control-panel-front-display-off.jpg"
            alt="DOGS² v1 control board front">
     </td>
-    <td width="50%">
+    <td width="25%">
       <img src="assets/photos/dogs2-control-panel-rear-components-angle.jpg"
            alt="DOGS² v1 control board rear">
     </td>
