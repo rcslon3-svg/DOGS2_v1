@@ -1,16 +1,34 @@
 # DOGS²
 
+**DOGS² (Dual Output Generator Supply Station)** is an open-source, standalone
+board bring-up station. It combines two programmable power outputs, current and
+voltage monitoring, a signal generator, and common embedded-interface tools in
+one compact instrument.
+
 <p align="center">
-  <img src="assets/photos/all_you_need.jpg"
+  <img src="assets/photos/start.jpg"
        alt="DOGS² v1 welcome screen"
        width="900">
 </p>
 
 <p align="center">
-  <img src="assets/photos/dogs2-working-prototype-front.png"
+  <img src="assets/photos/in_hand.png"
        alt="DOGS² v1 working engineering prototype"
        width="900">
 </p>
+
+- DC/DC power channel 1-48V / 5A peak with CV/CC operation, 50 uA current resolution;
+- LDO power channel 1.3-20V / 2A peak with CV/CC operation, 12.5 uA current resolution;
+- actual values voltage and current monitoring;
+- current graphics on display and phone app
+- square-wave generator;
+- UART and RS485 terminal modes;
+- CAN receive, filtering, and transmission;
+- LIN bus sniffer;
+- I2C sniffer and I2C master terminal;
+- analog probe and frequency meter input;
+- standalone TFT display, encoder, and front-panel controls;
+- Bluetooth SPP command and telemetry (current graph) connection.
 
 <p align="center">
   <strong><a href="https://dogs2.smartmoto.asia">Visit the DOGS² project website</a></strong><br>
@@ -18,10 +36,7 @@
   <a href="https://hackaday.io/project/206311-dogs-dual-output-generator-supply-station">Follow the development logs on Hackaday.io</a>
 </p>
 
-**DOGS² (Dual Output Generator Supply Station)** is an open-source, standalone
-board bring-up station. It combines two programmable power outputs, current and
-voltage monitoring, a signal generator, and common embedded-interface tools in
-one compact instrument.
+
 
 This repository documents the current **v1 engineering samples**. The hardware
 works and the firmware is under active development and tuning; published limits
@@ -31,7 +46,7 @@ not final product specifications.
 ## Project status
 
 Five v1 engineering samples have been assembled. Hardware characterization,
-firmware development, documentation, enclosure work, and preparation for
+firmware development, documentation, preparation for
 external beta testing are ongoing.
 
 **Want to follow or test DOGS²?** Visit the
@@ -51,33 +66,23 @@ for build updates, tests, limitations, and design progress.
 ## Current capabilities
 
 <p align="center">
-  <img src="assets/photos/pinout.jpg"
+  <img src="assets/photos/front.jpg"
        alt="DOGS² v1 connect and control"
        width="900">
 </p>
 
-- two independently controlled power channels with CV/CC operation;
-- voltage and current monitoring;
-- standalone TFT display, encoder, and front-panel controls;
-- square-wave generator;
-- UART and RS485 terminal modes;
-- CAN receive, filtering, and transmission;
-- I2C sniffer and I2C master terminal;
-- analog probe and frequency input;
-- Bluetooth SPP command and telemetry connection.
 
-The 1-Wire decoder and full LIN protocol support are still in development.
 
 ## Working hardware
 
 <table>
   <tr>
     <td width="33%">
-      <img src="assets/photos/dogs2-working-prototype-top.png"
-           alt="DOGS² v1 engineering prototype viewed from above">
+      <img src="assets/photos/menu_display.png"
+           alt="DOGS² v1 engineering prototype menu">
     </td>
     <td width="33%">
-      <img src="assets/photos/dogs2-signal-generator.jpg"
+      <img src="assets/photos/power_source_display.jpg"
            alt="DOGS² signal generator mode">
     </td>
     <td width="33%">
@@ -101,6 +106,14 @@ The 1-Wire decoder and full LIN protocol support are still in development.
     <td width="50%">
       <img src="assets/photos/dogs2-power-board-top-angle-closeup.jpg"
            alt="DOGS² v1 power board top-angle close-up">
+    </td>
+    <td width="50%">
+      <img src="assets/photos/dogs2-control-panel-front-display-off.jpg"
+           alt="DOGS² v1 control board front">
+    </td>
+    <td width="50%">
+      <img src="assets/photos/dogs2-control-panel-rear-components-angle.jpg"
+           alt="DOGS² v1 control board rear">
     </td>
   </tr>
   <tr>
